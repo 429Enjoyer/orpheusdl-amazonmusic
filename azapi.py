@@ -32,13 +32,14 @@ from audible.login import (
     create_s256_code_challenge,
     default_approval_alert_callback,
     default_captcha_callback,
+    default_login_url_callback,
     default_cvf_callback,
     default_otp_callback,
     extract_captcha_url,
     extract_code_from_url,
     get_inputs_from_soup,
     get_next_action_from_soup,
-    get_soup,
+    get_soup
 )
 from audible.metadata import encrypt_metadata
 from bs4 import BeautifulSoup
@@ -85,7 +86,7 @@ class AmazonMobileApplication(Enum):
         }[self]
     
 
-class AmazonMusicAPI:
+class AmazonMusicMobileAPI:
     """Amazon Music API"""
 
     # device_type = "A1DL2DVDQVK3Q"  ##A1MPSLFC7L5AFK is for Amazon, A1DL2DVDQVK3Q is for Amazon Music and A43PXU4ZN2AL1 is for Prime Video
@@ -104,6 +105,7 @@ class AmazonMusicAPI:
 
     def __init__(
         self,
+        country_code: str,
         credentials: Optional[AmazonMusicMobileAPICredentials] = None,
     ) -> None:
         default_headers = {
@@ -124,6 +126,10 @@ class AmazonMusicAPI:
             self.session.cookies.update(credentials.website_cookies)
         else:
             self.credentials = None
+            
+        if len(country_code) != 2:
+            raise ValueError(f"Country code must be a ISO 3166-1 alpha-2 value!, got: {country_code}")
+        self.country_code = country_code
         
         return
 
@@ -164,116 +170,10 @@ class AmazonMusicAPI:
             region="na",
         )
 
-        oauth_resp = self.session.get(oauth_url)
-        LOGGER.debug(oauth_resp)
-        oauth_soup = get_soup(oauth_resp)
-
-        login_inputs = get_inputs_from_soup(oauth_soup)
-        login_inputs["email"] = email
-        login_inputs["password"] = password
-        metadata = self._get_app_metadata(
-            user_agent=self.USER_AGENT, oauth_url=oauth_url
-        )
-        login_inputs["metadata1"] = encrypt_metadata(metadata)
-        method, url = get_next_action_from_soup(oauth_soup, {"name": "signIn"})
-
-        login_resp = self.session.request(method, url, data=login_inputs)
-        login_soup = get_soup(login_resp)
-
-        # check for captcha
-        while check_for_captcha(login_soup):
-            captcha_url = extract_captcha_url(login_soup)
-            if not captcha_url:
-                continue
-            guess = default_captcha_callback(captcha_url)
-
-            inputs = get_inputs_from_soup(login_soup)
-            inputs["guess"] = guess
-            inputs["use_image_captcha"] = "true"
-            inputs["use_audio_captcha"] = "false"
-            inputs["showPasswordChecked"] = "false"
-            inputs["email"] = email
-            inputs["password"] = password
-
-            method, url = get_next_action_from_soup(login_soup, {"name": "signIn"})
-
-            login_resp = self.session.request(method, url, data=inputs)
-            login_soup = get_soup(login_resp)
-
-        # check for choice mfa
-        # https://www.amazon.de/ap/mfa/new-otp
-        while check_for_choice_mfa(login_soup):
-            inputs = get_inputs_from_soup(login_soup)
-            for node in login_soup.select("div[data-a-input-name=otpDeviceContext]"):
-                # auth-TOTP, auth-SMS, auth-VOICE
-                if "auth-TOTP" in node["class"]:
-                    inp_node = node.find("input")
-                    inputs[inp_node["name"]] = inp_node["value"]
-
-            method, url = get_next_action_from_soup(login_soup)
-
-            login_resp = self.session.request(method, url, data=inputs)
-            login_soup = get_soup(login_resp)
-
-        # check for mfa (otp_code)
-        while check_for_mfa(login_soup):
-            otp_code = default_otp_callback()
-
-            inputs = get_inputs_from_soup(login_soup)
-            inputs["otpCode"] = otp_code
-            inputs["mfaSubmit"] = "Submit"
-            inputs["rememberDevice"] = "false"
-
-            method, url = get_next_action_from_soup(login_soup)
-
-            login_resp = self.session.request(method, url, data=inputs)
-            login_soup = get_soup(login_resp)
-
-        # check for cvf
-        while check_for_cvf(login_soup):
-            cvf_code = default_cvf_callback()
-
-            inputs = get_inputs_from_soup(login_soup)
-
-            method, url = get_next_action_from_soup(login_soup)
-
-            login_resp = self.session.request(method, url, data=inputs)
-            LOGGER.debug("cvf resp: %s, %s", login_resp, login_resp.text)
-            login_soup = get_soup(login_resp)
-
-            inputs = get_inputs_from_soup(login_soup)
-            inputs["action"] = "code"
-            inputs["code"] = cvf_code
-
-            method, url = get_next_action_from_soup(login_soup)
-
-            login_resp = self.session.request(method, url, data=inputs)
-            login_soup = get_soup(login_resp)
-
-        # check for approval alert
-        while check_for_approval_alert(login_soup):
-            default_approval_alert_callback()
-
-            # url = login_soup.find(id="resend-approval-link")["href"]
-            url = login_resp.url
-
-            login_resp = self.session.get(url)
-            login_soup = get_soup(login_resp)
-
-            while login_soup.find(
-                "span", {"class": "transaction-approval-word-break"}
-            ):  # a-size-base-plus transaction-approval-word-break a-text-bold
-                login_resp = self.session.get(url)
-                login_soup = get_soup(login_resp)
-                LOGGER.info("still waiting for redirect")
-
-        if b"openid.oa2.authorization_code" not in login_resp.url.query:
-            raise Exception("Login failed. Please check the log.")
-
+        # authorization_code = self._internal_login(self, oauth_url, email, password)
+        authorization_code = self._exteral_login(oauth_url)
+        
         LOGGER.debug(f"Login confirmed for {email} on {application.official_name}")
-
-        authorization_code = extract_code_from_url(login_resp.url)
-        LOGGER.debug(parse_qs(login_resp.url.query.decode()))
 
         items = {
             "authorization_code": authorization_code,
@@ -288,21 +188,22 @@ class AmazonMusicAPI:
         self.credentials = self.register(application=application, **items)
 
         # check home data, not required
-        customer_home_resp = self.session.post(
-            url=f"https://music.amazon.{self.credentials.domain}/{self.credentials.customer_info['home_region']}/api/stratus/",
-            data={
-                "customerId": None,  # it is not set, but it is required
-                "deviceId": self.credentials.device_info["device_serial_number"],
-                "deviceType": self.credentials.device_info["device_type"],
-                "ipAddress": None,
-                "sessionId": None,
-            },
-            headers={
-                "x-amz-target": "com.amazon.stratus.StratusServiceExternal.retrieveCustomerHome",
-                "x-amzn-RequestId": str(uuid.uuid4()),
-            },
-        )
-        LOGGER.debug(f"{customer_home_resp.status_code} {customer_home_resp.text}")
+        # TODO: move to seperate function
+        # customer_home_resp = self.session.post(
+        #     url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.customer_info['home_region']}/api/stratus/",
+        #     data={
+        #         "customerId": None,  # it is not set, but it is required
+        #         "deviceId": self.credentials.device_info["device_serial_number"],
+        #         "deviceType": self.credentials.device_info["device_type"],
+        #         "ipAddress": None,
+        #         "sessionId": None,
+        #     },
+        #     headers={
+        #         "x-amz-target": "com.amazon.stratus.StratusServiceExternal.retrieveCustomerHome",
+        #         "x-amzn-RequestId": str(uuid.uuid4()),
+        #     },
+        # )
+        # LOGGER.debug(f"{customer_home_resp.status_code} {customer_home_resp.text}")
 
         # confirm the device has been successfully authorized
 
@@ -393,34 +294,34 @@ class AmazonMusicAPI:
         Useful for parsing the web app configuration.
         """
         return self.get(
-            url=f"https://music.amazon.{self.credentials.domain}/",
+            url=f"https://music.amazon.{self.credentials.tld}/",
             headers={"User-Agent": self.USER_AGENT}
         ).text
 
     def get_metadata(
-        self, asins: str | typing.Sequence[str], country_code: str
+        self, asins: str | typing.Sequence[str]
     ) -> dict[str, list[dict[str, Any]]]:
         """
         Get metadata for a track, album, playlist or artist.
 
 
-        Track ASIN -> response.json()['tracksList'][0]
+        Track ASIN -> `response.json()['tracksList'][0]`
 
-        Album ASIN -> response.json()['albumsList'][0]
+        Album ASIN -> `response.json()['albumsList'][0]`
 
-        Artist ASIN -> response.json()['artistList'][0]
+        Artist ASIN -> `response.json()['artistList'][0]`
         
-        # List of avaliable features:
+        ## List of avaliable features:
         [fullAlbumDetails, playlistLibraryAvailability, disableSubstitution, childParentOwnership, trackLibraryAvailability,
         hasLyrics, ownership, expandTracklist, includeVideo, requestAudioVideo, popularity, albumArtist, collectionLibraryAvailability,
         includePurchaseDetails, editorialAssociations]
+        """
         #TODO figure out how to get avaliable qualities through this api (see mobile and web requests to get what i mean)
         # Valid keywords to Amazon JP (unknown)
         # objectId,fileName,fileExtension,fileSize,creationDate,lastUpdatedDate,orderId,asin,purchaseDate,localFilePath,md5,status,purchased,uploaded,title,sortTitle,rating,marketplace,physicalOrderId,assetType,artistName,artistAsin,contributors,trackNum,discNum,primaryGenre,duration,bitrate,composer,songWriter,performer,lyricist,publisher,errorCode,instantImport,primeStatus,isMusicSubscription,albumName,albumAsin,albumArtistName,albumArtistAsin,albumContributors,albumRating,albumPrimaryGenre,albumReleaseDate,sortArtistName,sortAlbumName,sortAlbumArtistName,audioUpgradeDate,parentalControls,assetEligibility,eligibility,internalTags
-        """
         asins = [asins] if isinstance(asins, str) else list(asins)
         response = self.post(
-            url=f"https://music.amazon.{self.credentials.domain}/{self.credentials.customer_info['home_region']}/api/muse/",
+            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.customer_info['home_region']}/api/muse/",
             headers={
                 "User-Agent": self.APP_USER_AGENT,
                 "x-amz-target": "com.amazon.musicensembleservice.MusicEnsembleService.lookup",
@@ -454,7 +355,7 @@ class AmazonMusicAPI:
                 "marketplaceId": None,
                 "metadataLang": None,
                 "musicRequestIdentityContextToken": None,
-                "musicTerritory": country_code,
+                "musicTerritory": self.country_code,
                 "requestedContent": "ALL_STREAMABLE",
                 "sessionId": None,
                 "stub": None,
@@ -469,7 +370,7 @@ class AmazonMusicAPI:
         return resp_json
 
     def get_track_lyrics(
-        self, track_asin: str, country_code: str = "US"
+        self, track_asin: str
     ) -> dict[str, Any]:
         """
         Get the lyrics for a track.
@@ -487,8 +388,11 @@ class AmazonMusicAPI:
                 `endTime`: The end time of the lyric in milliseconds.
                 `startTime`: The start time of the lyric in milliseconds.
                 `text`: The lyric text.
+
             `writers`: A list of strings with the lyric writers.
-        `lyricsResponseCode`: A string with the value '100(2)' if the lyrics were found, '200(1)' if not.
+
+        `lyricsResponseCode`: A string with the value '1002' if the lyrics were found, '2001' if not.
+
         `lyricsSource`: The source of the lyrics. One version is 'MUSIX_MATCH'.
 
         `trackAsinAndMarketplace`: A dictionary with the following keys:
@@ -497,7 +401,7 @@ class AmazonMusicAPI:
         """
 
         response = self.post(
-            url="https://music-xray-service.amazon.com/",
+            url=f"https://music-xray-service.amazon.{self.credentials.tld}/",
             headers={
                 "User-Agent": self.APP_USER_AGENT,
                 "x-amz-target": "com.amazon.musicxray.MusicXrayService.getLyricsByTrackAsinBatch",
@@ -507,7 +411,7 @@ class AmazonMusicAPI:
                 "trackAsinsAndMarketplaceList": [
                     {
                         "asin": track_asin,
-                        "musicTerritory": country_code,
+                        "musicTerritory": self.country_code,
                     }
                 ]
             },
@@ -515,13 +419,13 @@ class AmazonMusicAPI:
 
         return dict(response.json()["lyricsResponseList"][0])
 
-    def get_track_info(self, track_asin: str, country_code: str):
-        resp = self.get_metadata(track_asin, country_code=country_code)['trackList']
+    def get_track_info(self, track_asin: str):
+        resp = self.get_metadata(track_asin)['trackList']
         if len(resp) > 1:
             raise Exception("Failed to get track manifest: tracklist is greater than 1")
         return resp[0]
 
-    def get_track_manifest(self, asin: str, country_code: str):
+    def get_track_manifest(self, asin: str):
         """
         Get the playback manifest of a track (MPD)
 
@@ -533,7 +437,7 @@ class AmazonMusicAPI:
         """
         music_agent = f"Harley/{self.harley_version} Harley/{self.application_version} ( {str(uuid.uuid4())} {asin} )"
         response = self.post(
-            url=f"https://music.amazon.{self.credentials.domain}/{self.credentials.customer_info['home_region']}/api/dmls/getDashManifestsV2",
+            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.customer_info['home_region']}/api/dmls/getDashManifestsV2",
             headers={
                 "User-Agent": self.HARLEY_USER_AGENT,
                 "X-Amz-Requestid": str(uuid.uuid4()),
@@ -557,8 +461,8 @@ class AmazonMusicAPI:
                     #     "HAWKFIRE",
                     #     "KATANA",
                     # ],
-                    "marketplaceId": self.get_marketplace_id(country_code),
-                    "territoryId": country_code,
+                    "marketplaceId": self.get_marketplace_id(self.country_code),
+                    "territoryId": self.country_code,
                 },
                 "customerId": self.credentials.customer_id,
                 "deviceToken": {
@@ -745,7 +649,7 @@ class AmazonMusicAPI:
             store_authentication_cookie=store_authentication_cookie,
             device_info=device_info,
             customer_info=customer_info,
-            domain=domain,
+            tld=domain,
         )
 
         # authorize device for usage on Amazon Music
@@ -780,7 +684,7 @@ class AmazonMusicAPI:
                     "2f19adeb284eb36f7f07786152b9a1d14b21653203ad0b04ebbf9c73ab6d7625"
                 ],
                 "app_version": "522151214",
-                "app_version_name": AmazonMusicAPI.application_version,
+                "app_version_name": AmazonMusicMobileAPI.application_version,
                 "app_sms_hash": "QGCBba+brC5",
                 "map_version": amzn_app_id,
             },
@@ -813,7 +717,7 @@ class AmazonMusicAPI:
         serial = (
             serial or "PIXEL5" + build_device_serial()
         )  # requires some random model name at the start
-        client_id = AmazonMusicAPI._build_client_id(serial, application)
+        client_id = AmazonMusicMobileAPI._build_client_id(serial, application)
         code_challenge = create_s256_code_challenge(code_verifier)
 
         LOGGER.debug("device serial: %s", serial)
@@ -935,27 +839,27 @@ class AmazonMusicAPI:
             "battery": {},
             "performance": {
                 "timing": {
-                    "navigationStart": AmazonMusicAPI._now_to_unix_ms(),
+                    "navigationStart": AmazonMusicMobileAPI._now_to_unix_ms(),
                     "unloadEventStart": 0,
                     "unloadEventEnd": 0,
                     "redirectStart": 0,
                     "redirectEnd": 0,
-                    "fetchStart": AmazonMusicAPI._now_to_unix_ms(),
-                    "domainLookupStart": AmazonMusicAPI._now_to_unix_ms(),
-                    "domainLookupEnd": AmazonMusicAPI._now_to_unix_ms(),
-                    "connectStart": AmazonMusicAPI._now_to_unix_ms(),
-                    "connectEnd": AmazonMusicAPI._now_to_unix_ms(),
-                    "secureConnectionStart": AmazonMusicAPI._now_to_unix_ms(),
-                    "requestStart": AmazonMusicAPI._now_to_unix_ms(),
-                    "responseStart": AmazonMusicAPI._now_to_unix_ms(),
-                    "responseEnd": AmazonMusicAPI._now_to_unix_ms(),
-                    "domLoading": AmazonMusicAPI._now_to_unix_ms(),
-                    "domInteractive": AmazonMusicAPI._now_to_unix_ms(),
-                    "domContentLoadedEventStart": AmazonMusicAPI._now_to_unix_ms(),
-                    "domContentLoadedEventEnd": AmazonMusicAPI._now_to_unix_ms(),
-                    "domComplete": AmazonMusicAPI._now_to_unix_ms(),
-                    "loadEventStart": AmazonMusicAPI._now_to_unix_ms(),
-                    "loadEventEnd": AmazonMusicAPI._now_to_unix_ms(),
+                    "fetchStart": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "domainLookupStart": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "domainLookupEnd": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "connectStart": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "connectEnd": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "secureConnectionStart": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "requestStart": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "responseStart": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "responseEnd": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "domLoading": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "domInteractive": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "domContentLoadedEventStart": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "domContentLoadedEventEnd": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "domComplete": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "loadEventStart": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "loadEventEnd": AmazonMusicMobileAPI._now_to_unix_ms(),
                 }
             },
             "automation": {
@@ -968,7 +872,7 @@ class AmazonMusicAPI:
             "plugins": "unknown||412-732-732-24-*-*-*",
             "dupedPlugins": "unknown||412-732-732-24-*-*-*",
             "screenInfo": "412-732-732-24-*-*-*",
-            "userAgent": AmazonMusicAPI.USER_AGENT,
+            "userAgent": AmazonMusicMobileAPI.USER_AGENT,
             "webDriver": False,
             "capabilities": {
                 "css": {
@@ -1117,7 +1021,7 @@ class AmazonMusicAPI:
 
     def _list_devices(self):
         devices_resp = self.post(
-            url=f"https://music.amazon.{self.credentials.domain}/{self.credentials.customer_info['home_region']}/api/stratus/",
+            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.customer_info['home_region']}/api/stratus/",
             data={
                 "customerId": None,
                 "deviceId": self.credentials.device_info["device_serial_number"],
@@ -1150,7 +1054,7 @@ class AmazonMusicAPI:
             home_region = self.credentials.customer_info["home_region"]
 
         if not domain:
-            domain = self.credentials.domain
+            domain = self.credentials.tld
 
         if not hasattr(self, "credentials") and None in (
             device_serial,
@@ -1190,7 +1094,7 @@ class AmazonMusicAPI:
     
     def _retrieve_capability(self):
         response = self.post(
-            url=f"https://music.amazon.{self.credentials.domain}/{self.credentials.customer_info['home_region']}/api/stratus/",
+            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.customer_info['home_region']}/api/stratus/",
             headers={
                 'x-amz-target': 'com.amazon.stratus.StratusServiceExternal.retrieveCapability',
                 'x-amzn-requestid': str(uuid.uuid4())
@@ -1232,7 +1136,7 @@ class AmazonMusicAPI:
             }
 
             resp = self.post(
-                f"https://api.amazon.{self.credentials.domain}/auth/token",
+                f"https://api.amazon.{self.credentials.tld}/auth/token",
                 data=body,
                 sign=False
             )
@@ -1251,8 +1155,131 @@ class AmazonMusicAPI:
                 "To force refresh please use force=True"
             )
 
+    def _exteral_login(self, oauth_url: str):
+        response_url = httpx.URL(default_login_url_callback(oauth_url))
+        parsed_url = parse_qs(response_url.query.decode())
+
+        authorization_code = parsed_url["openid.oa2.authorization_code"][0]
+        return authorization_code
+
+    def _internal_login(self, oauth_url: str, email: str, password: str):
+        oauth_resp = self.session.get(oauth_url)
+        LOGGER.debug(oauth_resp)
+        oauth_soup = get_soup(oauth_resp)
+
+        login_inputs = get_inputs_from_soup(oauth_soup)
+        login_inputs["email"] = email
+        login_inputs["password"] = password
+        metadata = self._get_app_metadata(
+            user_agent=self.USER_AGENT, oauth_url=oauth_url
+        )
+        login_inputs["metadata1"] = encrypt_metadata(metadata)
+        method, url = get_next_action_from_soup(oauth_soup, {"name": "signIn"})
+
+        login_resp = self.session.request(method, url, data=login_inputs)
+        login_soup = get_soup(login_resp)
+
+        # check for captcha
+        while check_for_captcha(login_soup):
+            captcha_url = extract_captcha_url(login_soup)
+            if not captcha_url:
+                continue
+            guess = default_captcha_callback(captcha_url)
+
+            inputs = get_inputs_from_soup(login_soup)
+            inputs["guess"] = guess
+            inputs["use_image_captcha"] = "true"
+            inputs["use_audio_captcha"] = "false"
+            inputs["showPasswordChecked"] = "false"
+            inputs["email"] = email
+            inputs["password"] = password
+
+            method, url = get_next_action_from_soup(login_soup, {"name": "signIn"})
+
+            login_resp = self.session.request(method, url, data=inputs)
+            login_soup = get_soup(login_resp)
+
+        # check for choice mfa
+        # https://www.amazon.de/ap/mfa/new-otp
+        while check_for_choice_mfa(login_soup):
+            inputs = get_inputs_from_soup(login_soup)
+            for node in login_soup.select("div[data-a-input-name=otpDeviceContext]"):
+                # auth-TOTP, auth-SMS, auth-VOICE
+                if "auth-TOTP" in node["class"]:
+                    inp_node = node.find("input")
+                    inputs[inp_node["name"]] = inp_node["value"]
+
+            method, url = get_next_action_from_soup(login_soup)
+
+            login_resp = self.session.request(method, url, data=inputs)
+            login_soup = get_soup(login_resp)
+
+        # check for mfa (otp_code)
+        while check_for_mfa(login_soup):
+            otp_code = default_otp_callback()
+
+            inputs = get_inputs_from_soup(login_soup)
+            inputs["otpCode"] = otp_code
+            inputs["mfaSubmit"] = "Submit"
+            inputs["rememberDevice"] = "false"
+
+            method, url = get_next_action_from_soup(login_soup)
+
+            login_resp = self.session.request(method, url, data=inputs)
+            login_soup = get_soup(login_resp)
+
+        # check for cvf
+        while check_for_cvf(login_soup):
+            print("Check your email or SMS for a code from Amazon and enter it in the below prompt.")
+            cvf_code = default_cvf_callback()
+
+            inputs = get_inputs_from_soup(login_soup)
+
+            method, url = get_next_action_from_soup(login_soup)
+
+            login_resp = self.session.request(method, url, data=inputs)
+            LOGGER.debug("cvf resp: %s, %s", login_resp, login_resp.text)
+            login_soup = get_soup(login_resp)
+
+            inputs = get_inputs_from_soup(login_soup)
+            inputs["action"] = "code"
+            inputs["code"] = cvf_code
+
+            method, url = get_next_action_from_soup(login_soup)
+
+            login_resp = self.session.request(method, url, data=inputs)
+            login_soup = get_soup(login_resp)
+
+        # check for approval alert
+        while check_for_approval_alert(login_soup):
+            default_approval_alert_callback()
+
+            # url = login_soup.find(id="resend-approval-link")["href"]
+            url = login_resp.url
+
+            login_resp = self.session.get(url)
+            login_soup = get_soup(login_resp)
+
+            while login_soup.find(
+                "span", {"class": "transaction-approval-word-break"}
+            ):  # a-size-base-plus transaction-approval-word-break a-text-bold
+                login_resp = self.session.get(url)
+                login_soup = get_soup(login_resp)
+                LOGGER.info("still waiting for redirect")
+
+        # print(login_resp.url)
+        if b"openid.oa2.authorization_code" not in login_resp.url.query:
+            raise Exception("Login failed. Please check the log.")
+
+        authorization_code = extract_code_from_url(login_resp.url)
+        LOGGER.debug(parse_qs(login_resp.url.query.decode()))
+        return authorization_code    
+
     def get_marketplace_id(self, country_code: str) -> str:
         """Returns the marketplace id for a given country code"""
         # this is retrieved from the Amazon Music android app
         # marketplace ID for amazon prime video: ART4WZ8MWBX2Y
-        return {"US": "ATVPDKIKX0DER", "JP": "A1VC38T7YXB528"}[country_code.upper()]
+        return {
+            "US": "ATVPDKIKX0DER",
+            "JP": "A1VC38T7YXB528"
+        }[country_code.upper()]

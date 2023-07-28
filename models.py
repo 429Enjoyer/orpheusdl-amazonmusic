@@ -33,7 +33,7 @@ class AmazonMusicMobileAPICredentials:
     expires: datetime
     website_cookies: dict
     store_authentication_cookie: dict
-    domain: str
+    tld: str
     device_info: dict
     customer_info: dict
     customer_id: typing.Optional[str] = None
