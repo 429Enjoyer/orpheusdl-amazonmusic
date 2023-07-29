@@ -29,6 +29,6 @@ Initial version.
 
 # Special thanks
 - [audible](audible.readthedocs.io) library for creating the basic logic needed to login onto the mobile app
-- [mitmproxy](https://mitmproxy.org/) for helping me understand the mobile app's inbound and outband HTTP connections.
+- [mitmproxy](https://mitmproxy.org/) for helping me understand the mobile app's inbound and outbound HTTP connections.
 - [shaka-project](https://shaka-project.github.io/) for Widevine DRM decryption
 - Amazon for using a **secure** DRM.

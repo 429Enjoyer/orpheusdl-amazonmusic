@@ -59,6 +59,7 @@ module_information = ModuleInformation(  # Only service_name and module_supporte
         "country": "",
         "country_tld": "",
         "wvd_path": "",
+        "prefer_mha1": False
     },
     session_storage_variables=["credentials"],
     netlocation_constant="amazon",
@@ -224,6 +225,8 @@ class ModuleInterface:
             # filter out spatial audio, if specified
             if not codec_options.spatial_codecs:
                 avaliable_tracks = list(filter(lambda c: not codec_data[c.codec].spatial, avaliable_tracks))
+            if not self.settings['prefer_mha1']:
+                avaliable_tracks = list(filter(lambda c: c.codec.value != CodecEnum.MHA1.value, avaliable_tracks))
             
             LOGGER.debug(list(map(lambda x: x.quality, avaliable_tracks)))
             LOGGER.debug(avaliable_tracks)
@@ -236,7 +239,7 @@ class ModuleInterface:
             LOGGER.debug(avaliable_qualities_enum)
             # Select the highest quality avaliable, start iterating at max first
             track_to_use = None
-            for qualities, oquality in zip(reversed(list(self.quality_parse.values())), list(reversed(list(self.quality_parse)))):
+            for qualities, oquality in zip(reversed(list(self.quality_parse.values())), reversed(list(self.quality_parse))):
                 if oquality not in avaliable_qualities_enum:
                     continue
                 for quality in qualities:
@@ -477,7 +480,7 @@ class ModuleInterface:
                 start_time = int(line["startTime"])
                 start_time_str = self.milliseconds_to_lrc_time(start_time)
                 
-                embedded_lyrics += f"{text}\n"
+                embedded_lyrics += f"[{start_time_str}]{text}\n"
                 synced_lyrics += f"[{start_time_str}]{text}\n"
         
         
