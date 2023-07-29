@@ -205,6 +205,9 @@ class ModuleInterface:
                 if data and album_id in data
                 else self.mobile_session.get_metadata(album_id)["albumList"][0]
             )
+            
+            # print(self.web_session.get_album_info(track_id, album_id))
+            # return
 
             # TODO, unused for now
             # artists = self.mobile_session.get_metadata(
@@ -472,7 +475,7 @@ class ModuleInterface:
             start_time = int(line["startTime"])
             start_time_str = self.milliseconds_to_lrc_time(start_time)
             
-            embedded_lyrics += f"[{start_time_str}] {text}\n"
+            embedded_lyrics += f"{text}\n"
             synced_lyrics += f"[{start_time_str}]{text}\n"
         
         

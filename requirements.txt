@@ -6,5 +6,6 @@ brotli
 natsort
 xmltodict
 audible
-audible
 ffmpeg
+natsort
+bs4

@@ -1,6 +1,5 @@
 import base64
 import dataclasses
-from enum import Enum, auto
 import json
 import logging
 import logging.handlers
@@ -10,6 +9,7 @@ import secrets
 import typing
 import uuid
 from datetime import datetime, timedelta
+from enum import Enum, auto
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlencode
 from xml.etree import ElementTree
@@ -18,33 +18,24 @@ import httpx
 import rsa
 import rsa.pkcs1
 import xmltodict
-
 # from audible import Authenticator, Client, localization
 # from audible.auth import sign_request
-from audible.login import (
-    build_device_serial,
-    check_for_approval_alert,
-    check_for_captcha,
-    check_for_choice_mfa,
-    check_for_cvf,
-    check_for_mfa,
-    create_code_verifier,
-    create_s256_code_challenge,
-    default_approval_alert_callback,
-    default_captcha_callback,
-    default_login_url_callback,
-    default_cvf_callback,
-    default_otp_callback,
-    extract_captcha_url,
-    extract_code_from_url,
-    get_inputs_from_soup,
-    get_next_action_from_soup,
-    get_soup
-)
+from audible.login import (build_device_serial, check_for_approval_alert,
+                           check_for_captcha, check_for_choice_mfa,
+                           check_for_cvf, check_for_mfa, create_code_verifier,
+                           create_s256_code_challenge,
+                           default_approval_alert_callback,
+                           default_captcha_callback, default_cvf_callback,
+                           default_login_url_callback, default_otp_callback,
+                           extract_captcha_url, extract_code_from_url,
+                           get_inputs_from_soup, get_next_action_from_soup,
+                           get_soup)
 from audible.metadata import encrypt_metadata
 from bs4 import BeautifulSoup
 from Crypto.PublicKey import RSA
+
 from .models import AmazonMusicMobileAPICredentials, AmazonWebConfig
+from .az_web_api import AmazonWebAPI
 
 LOGGER = logging.getLogger(__name__)
 
@@ -275,7 +266,6 @@ class AmazonMusicMobileAPI:
             
 
     def get(self, url: str, headers: Optional[dict] = None) -> httpx.Response:
-        # simple implementation, untested atm
         d_headers = {
             "User-Agent": self.APP_USER_AGENT,
             "X-Amz-RequestId": str(uuid.uuid4()),
@@ -287,14 +277,14 @@ class AmazonMusicMobileAPI:
         self._apply_cookies_auth_flow(request)
         return self._wait_for_response(request)
     
-    def get_root(self):
+    def get_root(self, tld: typing.Optional[str] = None):
         """
         Get the response of the root URL of Amazon Music.
         
         Useful for parsing the web app configuration.
         """
-        return self.get(
-            url=f"https://music.amazon.{self.credentials.tld}/",
+        return self.session.get(
+            url=f"https://music.amazon.{tld or self.credentials.tld}/",
             headers={"User-Agent": self.USER_AGENT}
         ).text
 
@@ -319,6 +309,7 @@ class AmazonMusicMobileAPI:
         #TODO figure out how to get avaliable qualities through this api (see mobile and web requests to get what i mean)
         # Valid keywords to Amazon JP (unknown)
         # objectId,fileName,fileExtension,fileSize,creationDate,lastUpdatedDate,orderId,asin,purchaseDate,localFilePath,md5,status,purchased,uploaded,title,sortTitle,rating,marketplace,physicalOrderId,assetType,artistName,artistAsin,contributors,trackNum,discNum,primaryGenre,duration,bitrate,composer,songWriter,performer,lyricist,publisher,errorCode,instantImport,primeStatus,isMusicSubscription,albumName,albumAsin,albumArtistName,albumArtistAsin,albumContributors,albumRating,albumPrimaryGenre,albumReleaseDate,sortArtistName,sortAlbumName,sortAlbumArtistName,audioUpgradeDate,parentalControls,assetEligibility,eligibility,internalTags
+        
         asins = [asins] if isinstance(asins, str) else list(asins)
         response = self.post(
             url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.customer_info['home_region']}/api/muse/",
@@ -353,7 +344,7 @@ class AmazonMusicMobileAPI:
                 "filters": None,
                 "lang": "en_US",  # en_US i wonder if ja_JP would work for japanese | No it doesn't
                 "marketplaceId": None,
-                "metadataLang": None,
+                "metadataLang": "ja_JP",
                 "musicRequestIdentityContextToken": None,
                 "musicTerritory": self.country_code,
                 "requestedContent": "ALL_STREAMABLE",
@@ -368,6 +359,7 @@ class AmazonMusicMobileAPI:
         resp_json = response.json()
         LOGGER.debug(json.dumps(resp_json, indent=2))
         return resp_json
+
 
     def get_track_lyrics(
         self, track_asin: str
@@ -628,6 +620,13 @@ class AmazonMusicMobileAPI:
         extensions = success_response["extensions"]
         device_info = dict(extensions["device_info"])
         customer_info = dict(extensions["customer_info"])
+        
+        # Confirm home region is valid
+        
+        app_config = AmazonWebAPI.parse_for_app_config(self.get_root(domain))
+        if app_config is not None:
+            if customer_info["home_region"] != app_config['siteRegion']:
+                customer_info.update({"home_region": str(app_config['siteRegion'])})
 
         website_cookies = {
             cookie["Name"]: str(cookie["Value"]).replace(r'"', r"")
@@ -1086,6 +1085,7 @@ class AmazonMusicMobileAPI:
                 "x-amzn-RequestId": str(uuid.uuid4()),
             },
         )
+        LOGGER.debug(auth_device_resp.content)
         auth_device_resp_json = auth_device_resp.json()
         LOGGER.debug(
             f"{auth_device_resp.status_code} {json.dumps(auth_device_resp_json, indent=4)}"
@@ -1278,9 +1278,11 @@ class AmazonMusicMobileAPI:
     def get_marketplace_id(self, country_code: str) -> str:
         """Returns the marketplace id for a given country code"""
         # this is retrieved from the Amazon Music android app
+        # NOTE: this can be retrived by parsing the appConfig from the root on the netloc 
         # marketplace ID for amazon prime video: ART4WZ8MWBX2Y
         return {
             "US": "ATVPDKIKX0DER",
             "JP": "A1VC38T7YXB528",
-            "GB": "A1F83G8C2ARO7P"
+            "GB": "A1F83G8C2ARO7P",
+            "AU": "A39IBJ37TRP1C6"
         }[country_code.upper()]

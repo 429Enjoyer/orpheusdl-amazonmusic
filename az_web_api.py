@@ -3,21 +3,23 @@ import json
 import logging
 import math
 import os
-from pathlib import Path
 import pprint
 import random
 import re
 import time
 import typing
 import uuid
-from bs4 import BeautifulSoup, PageElement, ResultSet
-from audible import Authenticator
-import httpx
+from pathlib import Path
+
 import brotli
+import httpx
+import requests
 import urllib3
 import urllib3.exceptions
-import requests
-from .models import AmazonWebConfig, AmazonMusicMobileAPICredentials
+from audible import Authenticator
+from bs4 import BeautifulSoup, PageElement, ResultSet
+
+from .models import AmazonMusicMobileAPICredentials, AmazonWebConfig
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -92,53 +94,33 @@ class AmazonWebAPI:
             resp = self.get(url)
             response_text = resp.text
 
-        content = self.parse_html(response_text)
+        app_config = self.parse_for_app_config(response_text)
+        if not app_config:
+            LOGGER.error('No config available, log-on was not successful.')
+            return None
 
-        script_list: ResultSet[PageElement] = content.find_all("script")
-        for scripts in script_list:
-            if not 'appConfig' in scripts.contents[0]:
-                continue
-
-            LOGGER.debug(scripts)
-            sc = scripts.contents[0]
-            sc = sc.replace( "window.amznMusic = " , "" )
-            sc = sc.replace( "appConfig:" , "\"appConfig\":" )
-            sc = sc.replace( "ssr: false," , "\"ssr\":\"\"" )
-            sc = sc.replace( "false" , "\"\"" )
-            sc = sc.replace( "true" , "\"\"" )
-            sc = sc.replace( os.linesep , "" )
-            sc = sc.replace( ";" , "" )
-            # test if the user has a subscription
-            # if not 'tier' in sc:
-            #     print('No tier available, log-on was not successful.')
-            #     break
-            app_config = dict(json.loads(sc)['appConfig'])
-            config = AmazonWebConfig(
-                access_token=app_config['accessToken'],
-                csrf_token=app_config['csrf']['token'],
-                csrf_rnd=app_config['csrf']['rnd'],
-                csrf_ts=app_config['csrf']['ts'],
-                device_id=app_config['deviceId'],
-                device_type=app_config['deviceType'],
-                customer_id=app_config['customerId'] or AmazonWebConfig.customer_id,
-                marketplace_id=app_config['marketplaceId'],
-                session_id=app_config['sessionId'],
-                music_territory=app_config['musicTerritory'],
-                customer_lang=app_config['musicTerritory'].lower(),
-                locale=app_config['displayLanguage'],
-                region=app_config['siteRegion'] or "NA",
-                user_tld=country_tld or AmazonWebConfig.user_tld
-            )
-            LOGGER.debug('Config available')
-            # LOGGER.debug(json.dumps(app_config, indent=4))
-            LOGGER.debug(json.dumps(dataclasses.asdict(config), indent=4))
-            self.config_loaded = True
-            self.credentials = config
-            return config
-        
-        LOGGER.error('No config available, log-on was not successful.')
-        
-        return None
+        config = AmazonWebConfig(
+            access_token=app_config['accessToken'],
+            csrf_token=app_config['csrf']['token'],
+            csrf_rnd=app_config['csrf']['rnd'],
+            csrf_ts=app_config['csrf']['ts'],
+            device_id=app_config['deviceId'],
+            device_type=app_config['deviceType'],
+            customer_id=app_config['customerId'] or AmazonWebConfig.customer_id,
+            marketplace_id=app_config['marketplaceId'],
+            session_id=app_config['sessionId'],
+            music_territory=app_config['musicTerritory'],
+            customer_lang=app_config['musicTerritory'].lower(),
+            locale=app_config['displayLanguage'],
+            region=app_config['siteRegion'] or "NA",
+            user_tld=country_tld or AmazonWebConfig.user_tld
+        )
+        LOGGER.debug('Config available')
+        # LOGGER.debug(json.dumps(app_config, indent=4))
+        LOGGER.debug(json.dumps(dataclasses.asdict(config), indent=4))
+        self.config_loaded = True
+        self.credentials = config
+        return config
     
     def get_license_response(self, challenge: str):
         url = f"{self.music_url}{self.credentials.user_tld}/{self.credentials.region}/api/dmls/"
@@ -243,7 +225,8 @@ class AmazonWebAPI:
         }
         # data = f'"{data}"'
         LOGGER.debug(json.dumps(data).replace(': ', ":"))
-        url = 'https://na.mesk.skill.music.a2z.com/api/playCatalogAlbum'
+        print(json.dumps(data).replace(': ', ":"))
+        url = 'https://fe.mesk.skill.music.a2z.com/api/playCatalogAlbum'
         opt_resp = self.session.options(
            url=url,
            headers=headers 
@@ -298,6 +281,31 @@ class AmazonWebAPI:
 
 
         return head
+    
+    @staticmethod
+    def parse_for_app_config(response_text: str):
+        content = AmazonWebAPI.parse_html(response_text)
+
+        script_list: ResultSet[PageElement] = content.find_all("script")
+        for scripts in script_list:
+            if not 'appConfig' in scripts.contents[0]:
+                continue
+
+            LOGGER.debug(scripts)
+            sc = scripts.contents[0]
+            sc = sc.replace( "window.amznMusic = " , "" )
+            sc = sc.replace( "appConfig:" , "\"appConfig\":" )
+            sc = sc.replace( "ssr: false," , "\"ssr\":\"\"" )
+            sc = sc.replace( "false" , "\"\"" )
+            sc = sc.replace( "true" , "\"\"" )
+            sc = sc.replace( os.linesep , "" )
+            sc = sc.replace( ";" , "" )
+            # test if the user has a subscription
+            # if not 'tier' in sc:
+            #     print('No tier available, log-on was not successful.')
+            #     break
+            return dict(json.loads(sc)['appConfig'])
+        return
     
     @staticmethod
     def parse_html(api_resp):
