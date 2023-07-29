@@ -150,7 +150,7 @@ class ModuleInterface:
     def custom_url_parse(self, link: str) -> MediaIdentification:
         url = urlparse(link)
         
-        if not url.netloc.endswith(self.settings["country_tld"]):
+        if not url.netloc.endswith(self.mobile_session.credentials.tld):
             raise ValueError(f"You must provide a URL that is within the same region as the account!")
 
         queries = url.query.split("&")
@@ -467,16 +467,18 @@ class ModuleInterface:
         #     data[track_id] if track_id in data else self.mobile_session.get_track_lyrics(track_id)
         # )
         track_lyrics_resp = self.mobile_session.get_track_lyrics(track_id)
+
         embedded_lyrics = ""
         synced_lyrics = ""
-        for line in track_lyrics_resp.get("lyrics", [{}]).get("lines", {}):
-            text = line["text"]
-            
-            start_time = int(line["startTime"])
-            start_time_str = self.milliseconds_to_lrc_time(start_time)
-            
-            embedded_lyrics += f"{text}\n"
-            synced_lyrics += f"[{start_time_str}]{text}\n"
+        if track_lyrics_resp.get("lyricsResponseCode") == "1002":
+            for line in track_lyrics_resp.get("lyrics", [{}]).get("lines", {}):
+                text = line["text"]
+                
+                start_time = int(line["startTime"])
+                start_time_str = self.milliseconds_to_lrc_time(start_time)
+                
+                embedded_lyrics += f"{text}\n"
+                synced_lyrics += f"[{start_time_str}]{text}\n"
         
         
         return LyricsInfo(embedded=embedded_lyrics, synced=synced_lyrics)  # both optional if not found
