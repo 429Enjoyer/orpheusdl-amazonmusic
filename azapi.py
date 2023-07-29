@@ -1281,5 +1281,6 @@ class AmazonMusicMobileAPI:
         # marketplace ID for amazon prime video: ART4WZ8MWBX2Y
         return {
             "US": "ATVPDKIKX0DER",
-            "JP": "A1VC38T7YXB528"
+            "JP": "A1VC38T7YXB528",
+            "GB": "A1F83G8C2ARO7P"
         }[country_code.upper()]
