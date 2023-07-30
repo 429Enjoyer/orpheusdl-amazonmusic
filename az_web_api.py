@@ -155,7 +155,8 @@ class AmazonWebAPI:
     
     def get_album_info(self, track_asin: str, album_asin: str):
         # NOTE: Dead end as of right now (July 26, 2023) (Sorry this content is not avaliable in your region)
-        # NOTE: this API endpoint may not be avalible for items in which they are behind a paywall (AMU)
+        # NOTE: no access token in data headers works, need to try with showCatalogArtist instead of album because no max res image in showCatalogAlbum
+        url = 'https://fe.mesk.skill.music.a2z.com/api/playCatalogAlbum'
         headers = {
             'User-Agent': self.user_agent,
             'Accept': '*/*',
@@ -163,7 +164,7 @@ class AmazonWebAPI:
             'Accept-Encoding': 'gzip, deflate, br',
             'Referer': f'https://music.amazon.{self.credentials.user_tld}/',
             'Content-Type': 'text/plain;charset=UTF-8',
-            'Host': 'na.mesk.skill.music.a2z.com',
+            'Host': 'fe.mesk.skill.music.a2z.com',
             # 'Content-Length': '2770',
             'Origin': f'https://music.amazon.{self.credentials.user_tld}',
             'DNT': '1',
@@ -176,34 +177,45 @@ class AmazonWebAPI:
             # Requests doesn't support trailers
             'TE': 'trailers',
         }
+        opt_resp = self.session.options(
+           url=url,
+           headers=headers 
+        )
+        print(opt_resp.cookies)
+        headers = headers | {"Cookie": opt_resp.cookies.get("AWSALB")}
+        # self.mobile_app_credentials.access_token
 
-        data = {
+        data_own = json.dumps({
             "at":f"{track_asin}", # The Track ASIN
-            "headers": json.dumps({
-                "x-amzn-authentication": json.dumps({
+            "id":f"{album_asin}", # The Album ASIN
+            "userHash":json.dumps({
+                "level":"HD_MEMBER"
+            }),
+            "headers":json.dumps({
+                "x-amzn-authentication":json.dumps({
                     "interface":"ClientAuthenticationInterface.v1_0.ClientTokenElement",
-                    "accessToken": self.mobile_app_credentials.access_token
-                }).replace('\\\\', '\\'), 
+                    "accessToken":f"{self.credentials.access_token}"
+                }), 
                 "x-amzn-device-model":"WEBPLAYER",
                 "x-amzn-device-width":"1920",
-                "x-amzn-device-height":"1080",
                 "x-amzn-device-family":"WebPlayer",
                 "x-amzn-device-id":f"{self.credentials.device_id}",
                 "x-amzn-user-agent":f"{self.user_agent}",
                 "x-amzn-session-id":f"{self.credentials.session_id}",
+                "x-amzn-device-height":"1080",
                 "x-amzn-request-id":f"{str(uuid.uuid4()).lower()}",
                 "x-amzn-device-language":"en_US",
-                "x-amzn-currency-of-preference":"USD",
+                "x-amzn-currency-of-preference":"JPY",
                 "x-amzn-os-version":"1.0",
                 "x-amzn-application-version":"1.0.12528.0",
                 "x-amzn-device-time-zone":"America/Toronto",
-                "x-amzn-timestamp":f"{str(int(time.time()))}",
+                "x-amzn-timestamp":f"{str(time.time_ns() // 1_000_000)}",
                 "x-amzn-csrf":json.dumps({
                     "interface":"CSRFInterface.v1_0.CSRFHeaderElement",
                     "token":f"{self.credentials.csrf_token}",
                     "timestamp":f"{self.credentials.csrf_ts}",
                     "rndNonce":f"{self.credentials.csrf_rnd}"
-                }).replace('\\\\', '\\'),
+                }),
                 "x-amzn-music-domain":f"music.amazon.{self.credentials.user_tld}",
                 "x-amzn-referer":f"music.amazon.{self.credentials.user_tld}",
                 "x-amzn-affiliate-tags":"",
@@ -216,28 +228,22 @@ class AmazonWebAPI:
                 #     "token":"eyJhbGciOiJIUzUxMiJ9.CjRhbXpu...",
                 #     "expirationMS":1690482237910
                 # }).replace('\\\\', '\\'),
+                "x-amzn-video-player-token":"",
                 "x-amzn-feature-flags":""
-            }),
-            "id":f"{album_asin}", # The Album ASIN
-            "userHash":json.dumps({
-                "level":"HD_MEMBER"
-            }),
-        }
+            })
+        })
+        data_own = data_own.replace(": ", ":")
+        # diff = difflib.ndiff()
+        # print(f"\nIs data_own the same as data? {}\n")
         # data = f'"{data}"'
-        LOGGER.debug(json.dumps(data).replace(': ', ":"))
-        print(json.dumps(data).replace(': ', ":"))
-        url = 'https://fe.mesk.skill.music.a2z.com/api/playCatalogAlbum'
-        opt_resp = self.session.options(
-           url=url,
-           headers=headers 
-        )
-        LOGGER.debug(opt_resp.cookies)
+        LOGGER.debug(json.dumps(data_own))
+        print(data_own)
 
         response = self.session.post(
             url=url,
             headers=headers,
-            json=data,
-            cookies=dict(opt_resp.cookies.items()) | self.mobile_app_credentials.website_cookies
+            data=data_own,
+            cookies=self.mobile_app_credentials.website_cookies
         )
         LOGGER.debug([f"{k}: {v}" for k, v in vars(response).items()])
                 
@@ -245,6 +251,7 @@ class AmazonWebAPI:
         resp_json = response.json()
         LOGGER.debug(json.dumps(resp_json, indent=2))
         return dict(resp_json)
+    
 
     def prep_request_header(self, amz_target=None):
         """

@@ -6,6 +6,7 @@ import logging.handlers
 import math
 import re
 import secrets
+import time
 import typing
 import uuid
 from datetime import datetime, timedelta
@@ -80,8 +81,7 @@ class AmazonMobileApplication(Enum):
 class AmazonMusicMobileAPI:
     """Amazon Music API"""
 
-    # device_type = "A1DL2DVDQVK3Q"  ##A1MPSLFC7L5AFK is for Amazon, A1DL2DVDQVK3Q is for Amazon Music and A43PXU4ZN2AL1 is for Prime Video
-    application_version = "22.15.12"
+    application_version = "23.7.0"
     harley_version = "3.12.3.86"
 
     HARLEY_USER_AGENT = f"Harley/{harley_version} {AmazonMobileApplication.MUSIC.device_type}/{application_version}"
@@ -164,7 +164,7 @@ class AmazonMusicMobileAPI:
         # authorization_code = self._internal_login(self, oauth_url, email, password)
         authorization_code = self._exteral_login(oauth_url)
         
-        LOGGER.debug(f"Login confirmed for {email} on {application.official_name}")
+        print(f"Login confirmed for {email} on {application.official_name}")
 
         items = {
             "authorization_code": authorization_code,
@@ -344,7 +344,7 @@ class AmazonMusicMobileAPI:
                 "filters": None,
                 "lang": "en_US",  # en_US i wonder if ja_JP would work for japanese | No it doesn't
                 "marketplaceId": None,
-                "metadataLang": "ja_JP",
+                "metadataLang": "", #ja_JP for tagging in japanese, blank for locale
                 "musicRequestIdentityContextToken": None,
                 "musicTerritory": self.country_code,
                 "requestedContent": "ALL_STREAMABLE",
@@ -360,6 +360,139 @@ class AmazonMusicMobileAPI:
         LOGGER.debug(json.dumps(resp_json, indent=2))
         return resp_json
 
+    def search(self, query: str, asin: typing.Optional[str] = None, search_types: typing.Optional[typing.Iterable] = None, limit: typing.Optional[int] = 50):
+        """
+        Search for a item using a query.
+        
+        Args:
+            asin: str (Optional): To return only the item in which the ASIN is included.
+            search_types: Iterable (Optional): Search for a specific catalog type.
+            
+            Valid types are:
+            `catalog_album, catalog_artist, catalog_playlist, catalog_station,
+            catalog_track, livesports_program, catalog_video, catalog_video_playlist,
+            catalog_podcast_show, catalog_podcast_episode, live_event`
+            
+        """
+
+        url = f"https://music.amazon.{self.credentials.tld}/{self.credentials.customer_info['home_region']}/api/textsearch/search/v1_1/"
+        headers = {
+            "x-amz-target": "com.amazon.tenzing.textsearch.v1_1.TenzingTextSearchServiceExternalV1_1.search",
+            "User-Agent": "MusicAndroid/23.7.0",
+            "X-Amz-Requestid": str(uuid.uuid4()).lower(),
+        }
+        if search_types is None:
+            search_types = [
+                "catalog_album"
+            ]
+        
+        result_specs = [
+            {
+                "contentRestrictions": {
+                    "allowedParentalControls": {
+                        "hasExplicitLanguage": True
+                    },
+                    "assetQuality": {
+                        "quality": []
+                    },
+                    "contentTier": "UNLIMITED",
+                    "eligibility": None
+                },
+                "documentSpecs": [
+                    {
+                        "fields": [
+                            "__default",
+                            "parentalControls.hasExplicitLanguage",
+                            "contentTier",
+                            "artOriginal",
+                            "contentEncoding"
+                        ],
+                        "filters": None,
+                        "type": label_type
+                    }
+                ],
+                "label": label_type,
+                "maxResults": limit,
+                "pageToken": None,
+                "topHitSpec": None
+            }
+            for label_type in search_types
+        ]
+        
+        data = {
+            "customerIdentity": {
+                "customerId": self.credentials.customer_id,
+                "deviceId": self.credentials.device_info["device_serial_number"],
+                "deviceType": AmazonMobileApplication.MUSIC.device_type,
+                "musicRequestIdentityContextToken": None,
+                "sessionId": "123-1234567-5555555" # this is legit what the app uses :skull:
+            },
+            "explain": None,
+            "features": {
+                "spellCorrection": {
+                    "accepted": None,
+                    "allowCorrection": True,
+                    "rejected": None
+                },
+                "spiritual": None,
+                "upsell": {
+                    "allowUpsellForCatalogContent": False
+                }
+            },
+            "locale": "en_US", # TODO use custom locale
+            "musicTerritory": self.country_code,
+            "query": query,
+            "queryMetadata": None,
+            "resultSpecs": result_specs
+        }
+        
+        response = self.post(
+            url=url,
+            headers=headers,
+            data=data
+        )
+        resp_json = response.json()
+        LOGGER.debug(resp_json)
+        results = resp_json.get("results", {})
+        if not asin:
+            return results
+        return self.find_item_by_asin_in_search_results(results, asin)
+    
+    def get_recent_tracks(self):
+        """
+        Get the logged in user's recent tracks.
+        """
+        url = f"https://music.amazon.{self.credentials.tld}/api/nimbly/"
+        headers = {
+            "x-amz-target": "com.amazon.nimblymusicservice.NimblyMusicService.GetRecentTrackActivity",
+            "User-Agent": self.APP_USER_AGENT,
+            "X-Amz-Requestid": str(uuid.uuid4()).lower(),
+        }
+        data = {
+            # "activityTypeFilters": ["PLAYED"],
+            "allowedParentalControls": None,
+            "customerId": None,
+            "deviceId": self.credentials.device_info["device_serial_number"],
+            "deviceType": AmazonMobileApplication.MUSIC.device_type,
+            "features": [
+                "HIGHQUALITY"
+            ],
+            "languageLocale": None,
+            "marketplaceId": None,
+            "musicRequestIdentityContext": None,
+            "musicRequestIdentityContextToken": None,
+            "musicTerritory": self.country_code,
+            "pageToken": ""
+        }
+        resp = self.post(
+            url=url,
+            headers=headers,
+            data=data,
+            sign=True
+        )
+        
+        print(json.dumps(resp.json(), indent=3))
+        return resp.json()
 
     def get_track_lyrics(
         self, track_asin: str
@@ -411,12 +544,6 @@ class AmazonMusicMobileAPI:
 
         return dict(response.json()["lyricsResponseList"][0])
 
-    def get_track_info(self, track_asin: str):
-        resp = self.get_metadata(track_asin)['trackList']
-        if len(resp) > 1:
-            raise Exception("Failed to get track manifest: tracklist is greater than 1")
-        return resp[0]
-
     def get_track_manifest(self, asin: str):
         """
         Get the playback manifest of a track (MPD)
@@ -424,7 +551,7 @@ class AmazonMusicMobileAPI:
         Returns:
         The Amazon Music Dash Manifest as a `xml.etree.ElementTree`
         
-        TRACK_PSSH + SIREN_KATANA = All audio format (Lossless and 360) but, ffmpeg can convert (lossless) but doesn't play on DeaDBeeF?
+        TRACK_PSSH + SIREN_KATANA = All audio format (Lossless and 360).
         TRACK_PSSH + SIREN_KATANA_NO_CLEAR_LEAD = No issues, only up to lossless
         """
         music_agent = f"Harley/{self.harley_version} Harley/{self.application_version} ( {str(uuid.uuid4())} {asin} )"
@@ -489,6 +616,20 @@ class AmazonMusicMobileAPI:
         # return ElementTree.fromstring(manifest)
         # return resp_dict["contentResponseList"][0]["manifest"]
 
+    # Shortcuts
+
+    def get_track_info(self, track_asin: str):
+        resp = self.get_metadata(track_asin)['trackList']
+        if len(resp) > 1:
+            raise Exception("Failed to get track manifest: tracklist is greater than 1")
+        return resp[0]
+
+    def get_album_info(self, track_asin: str):
+        resp = self.get_metadata(track_asin)["albumList"]
+        if len(resp) > 1:
+            raise Exception("Failed to get track manifest: tracklist is greater than 1")
+        return resp[0]
+
     def get_license_response(self, asin: str, challenge: str) -> str:
         """
         Do not use this function.
@@ -503,7 +644,7 @@ class AmazonMusicMobileAPI:
             url="https://music.amazon.com/NA/api/dmls/",
             data={
                 "DrmType": "WIDEVINE_ENTITLEMENT", # entitlement is not possible without the proper widevine device (9480)
-                # "DrmType": "WIDEVINE", #TODO add request cookies (required for this, find out which specifically)
+                # "DrmType": "WIDEVINE"
                 "appInfo": {
                     "musicAgent": f"Harley/{self.harley_version} Harley/{self.application_version} ( {str(uuid.uuid4())} {asin} )"
                 },
@@ -528,6 +669,61 @@ class AmazonMusicMobileAPI:
             raise Exception(f"Failed to get license: {response.status_code} {response.text}")
 
         return response.json()['license']
+
+    def get_album_page(self, asin: str):
+        response = self.post(
+            url=f"https://{str(self.credentials.customer_info['home_region']).lower()}.mobilemesk.skill.music.a2z.com/api/showCatalogAlbum",
+            headers={
+                "x-amzn-device-id": self.credentials.device_info["device_serial_number"],
+                "x-amzn-device-family": "MobileAndroid",
+                "x-amzn-device-manufacturer": "Google",
+                "x-amzn-device-model": "Pixel 5",
+                "x-amzn-device-language": "en_US",
+                "x-amzn-device-height": "2560",
+                "x-amzn-device-width": "1440",
+                "x-amzn-device-scale": "3.5",
+                "x-amzn-application-version": "23.7.0",
+                "x-amzn-os-version": "11",
+                "x-amzn-device-time-zone": "America/Toronto",
+                "x-amzn-timestamp": f"{time.time_ns() // 1_000_000}",
+                "x-amzn-user-agent": "MusicAndroid/23.7.0",
+                "x-amzn-device-type-id": AmazonMobileApplication.MUSIC.device_type,
+                "x-amzn-request-id": str(uuid.uuid4()),
+                "x-amzn-authentication": json.dumps({"interface":"ClientAuthenticationInterface.v1_0.ClientTokenElement","accessToken":f"{self.credentials.access_token}"}),
+                "x-amzn-session-id": self.credentials.website_cookies['session-id'],
+                "x-amzn-feature-flags": "", #includeArtistRefinements
+                "content-type": "application/json; charset=utf-8",
+                "accept-encoding": "gzip",
+                "user-agent": "okhttp/4.10.0",
+            },
+            data={
+                "id": asin
+            }
+        )
+        # "libraryArtistId": "-1"
+        LOGGER.debug(json.dumps(response.json(), indent=3))
+        print(json.dumps(response.json(), indent=3))
+        
+        return response.json()
+
+    def find_item_by_asin_in_search_results(self, results: dict, asin: str):
+        """
+        Comedically long function name
+        """
+        for category in results:
+            if int(category['totalHitCount']) == 0:
+                continue
+            for hit in category['hits']:
+                document = dict(hit['document'])
+                asins = [
+                   str(document.get(item))
+                   for item in ("albumAsin", "artistAsin", "asin")
+                   if document.get(item)
+                ]
+                if asin not in asins:
+                    continue
+                return document
+        return
 
     def register(
         self,

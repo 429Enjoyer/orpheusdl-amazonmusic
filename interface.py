@@ -193,7 +193,7 @@ class ModuleInterface:
             if self.mobile_session.credentials.access_token_expired:
                 self.mobile_session.refresh_access_token()
 
-            quality_to_use = self.quality_parse[quality_tier]
+            # quality_to_use = self.quality_parse[quality_tier]
             
             track_data = (
                 data[track_id]
@@ -204,19 +204,23 @@ class ModuleInterface:
             album_data = (
                 data[album_id]
                 if data and album_id in data
-                else self.mobile_session.get_metadata(album_id)["albumList"][0]
+                else self.mobile_session.get_album_info(album_id)
+            )
+            search_data = (
+                data[f"{album_id}_search"]
+                if data and f"{album_id}_search" in data
+                else self.mobile_session.search(
+                    query=f"{album_data['title']} - {track_data['title']}",
+                    asin=track_id,
+                    search_types=["catalog_track"]
+                )
             )
             
-            # print(self.web_session.get_album_info(track_id, album_id))
-            # return
-
             # TODO, unused for now
             # artists = self.mobile_session.get_metadata(
             #     [track_data["artist"]["asin"], *track_data["artist"]["contributorAsins"]], self.settings["country"]
             # )["artistList"]
             
-            # wp_album_data = self.web_session.get_album_info(track_asin=track_id, album_asin=track_data["album"]["asin"])
-
             release_datetime = self._get_date_from_metadata(album_data)
             mpd = dict(self.mobile_session.get_track_manifest(track_id))
             # LOGGER.debug(json.dumps(mpd, indent=3))
@@ -238,8 +242,9 @@ class ModuleInterface:
             )
             LOGGER.debug(avaliable_qualities_enum)
             # Select the highest quality avaliable, start iterating at max first
+            # NOTE there *could* be a different way of doing this, i'm just stupid af
             track_to_use = None
-            for qualities, oquality in zip(reversed(list(self.quality_parse.values())), reversed(list(self.quality_parse))):
+            for qualities, oquality in zip(reversed(self.quality_parse.values()), reversed(self.quality_parse)):
                 if oquality not in avaliable_qualities_enum:
                     continue
                 for quality in qualities:
@@ -253,14 +258,21 @@ class ModuleInterface:
                 
             # track_to_use = avaliable_tracks[0] # avaliable_tracks[-1] #avaliable_tracks[0]
             LOGGER.debug(f"Using AudioTrack: {track_to_use}")
-
+            
+            disc_total = max(int(t['discNum']) for t in album_data.get('tracks', [{}]))
+            composers = "; ".join(
+                natsort.natsorted(
+                    track_data.get("songWriters", [album_data["primaryArtistName"]])
+                )
+            )
             tags = Tags(  # every single one of these is optional
                 album_artist=album_data["primaryArtistName"],
-                composer=album_data["primaryArtistName"],
+                composer=composers,
                 copyright=album_data["productDetails"]["copyright"],
                 isrc=track_data["isrc"],
                 # upc="",
                 disc_number=int(track_data["discNum"] or 1),
+                total_discs=disc_total,
                 track_number=int(track_data["trackNum"] or 1),  # None/0/1 if no discs
                 total_tracks=int(album_data["trackCount"] or 1),  # None/0/1 if no discs
                 # replay_gain=0.0,
@@ -268,8 +280,10 @@ class ModuleInterface:
                 genres=[album_data["productDetails"]["primaryGenreName"]],
                 label=album_data["productDetails"]["label"],
                 release_date=release_datetime.strftime("%Y-%m-%d"),  # Format: YYYY-MM-DD
+                comment=f"https://music.amazon.{self.mobile_session.credentials.tld}/albums/{album_id}",
                 extra_tags={
-                    "Merchant": " ".join(str(album_data["productDetails"]["merchantName"]).split())
+                    "Merchant": " ".join(str(album_data["productDetails"]["merchantName"]).split()),
+                    "Composer": composers # force set the composer tag, because orpheus doesn't handle it
                 }
             )
 
@@ -277,11 +291,10 @@ class ModuleInterface:
                 name=track_data["title"],
                 album_id=album_id,
                 album=track_data["album"]["title"],
-                # artists=list({artist["name"] for artist in artists}), #TODO fix, maybe use ["tracks"][0]["songWriters"]
                 artists=[album_data["artist"]["name"]],
                 tags=tags,
                 codec=track_to_use.codec,
-                cover_url=album_data["image"],  # make sure to check module_controller.orpheus_options.default_cover_options
+                cover_url=search_data['artOriginal']['artUrl'],  # make sure to check module_controller.orpheus_options.default_cover_options
                 release_year=release_datetime,
                 explicit=track_data["parentalControls"]["hasExplicitLanguage"],
                 artist_id=track_data["artist"]["asin"],  # optional
@@ -292,8 +305,6 @@ class ModuleInterface:
                 sample_rate=track_to_use.sample_rate,  # optional
                 # bitrate=1411,  # optional
                 download_extra_kwargs={
-                    # "file_url": A,
-                    # "codec": "",
                     "audio_track": track_to_use,
                 },  # optional only if download_type isn't DownloadEnum.TEMP_FILE_PATH, whatever you want
                 # cover_extra_kwargs={
@@ -330,7 +341,7 @@ class ModuleInterface:
 
             license_response = self.web_session.get_license_response(license_challenge)
             if not license_response:
-                license_response = input("Enter response here: ")
+                license_response = input("License retrieval failed, enter response here: ")
             self.cdm.parse_license(session_id, license_response)
 
             decrypted_track_location = f"{create_temp_filename()}.mp4" #{codec_data[audio_track.codec].container.name}
@@ -350,7 +361,7 @@ class ModuleInterface:
 
             LOGGER.debug(f"Using {selected_codec_data.container.name} as the container for {audio_track.codec.name}")
             final_decrypted_track_location = f"{create_temp_filename()}.{selected_codec_data.container.name}"
-            ffmpeg.input(decrypted_track_location).output(final_decrypted_track_location, loglevel='warning').run()
+            ffmpeg.input(decrypted_track_location).output(final_decrypted_track_location, loglevel='warning', audio_bitrate=audio_track.bitrate).run()
 
         except Exception as e:
             print(e)
@@ -373,7 +384,15 @@ class ModuleInterface:
             album_data = (
                 data[album_id]
                 if album_id in data
-                else self.mobile_session.get_metadata(album_id)["albumList"][0]
+                else self.mobile_session.get_album_info(album_id)
+            )
+            search_data = (
+                data[f"{album_id}_search"]
+                if data and f"{album_id}_search" in data
+                else self.mobile_session.search(
+                    query=f"{album_data['artist']['name']} - {album_data['title']}",
+                    asin=album_id
+                )
             )
             ai = AlbumInfo(
                 name=album_data.get("title", "Unknown"),
@@ -384,12 +403,12 @@ class ModuleInterface:
                 duration=album_data.get("duration"),
                 artist_id=album_data.get("artist", {}).get("asin"),  # optional
                 # booklet_url="",  # optional
-                cover_url=album_data.get("image"),  # optional
+                cover_url=search_data.get("artOriginal", {}).get("artUrl", album_data.get("image")),  # optional
                 cover_type=ImageFileTypeEnum.jpg,  # optional
                 all_track_cover_jpg_url="",  # technically optional, but HIGHLY recommended
                 animated_cover_url="",  # optional
                 description="",  # optional
-                track_extra_kwargs={"data": {track['asin']: track for track in album_data.get("tracks", [])} | {album_id: album_data}},  # optional, whatever you want
+                track_extra_kwargs={"data": {track['asin']: track for track in album_data.get("tracks", [])} | {album_id: album_data} | {f"{album_id}_search": search_data}},  # optional, whatever you want
             )
             LOGGER.debug(ai)
             return ai
@@ -466,21 +485,18 @@ class ModuleInterface:
     def get_track_lyrics(
         self, track_id: str, data={}
     ) -> LyricsInfo:  # Mandatory if ModuleModes.lyrics
-        # track_data = (
-        #     data[track_id] if track_id in data else self.mobile_session.get_track_lyrics(track_id)
-        # )
         track_lyrics_resp = self.mobile_session.get_track_lyrics(track_id)
 
         embedded_lyrics = ""
         synced_lyrics = ""
-        if track_lyrics_resp.get("lyricsResponseCode") == "1002":
-            for line in track_lyrics_resp.get("lyrics", [{}]).get("lines", {}):
+        if int(track_lyrics_resp.get("lyricsResponseCode", 0)) == 1002:
+            for line in track_lyrics_resp.get("lyrics", {"lines": []}).get("lines"):
                 text = line["text"]
                 
                 start_time = int(line["startTime"])
                 start_time_str = self.milliseconds_to_lrc_time(start_time)
                 
-                embedded_lyrics += f"[{start_time_str}]{text}\n"
+                embedded_lyrics += f"[{start_time_str}] {text}\n"
                 synced_lyrics += f"[{start_time_str}]{text}\n"
         
         
@@ -508,7 +524,7 @@ class ModuleInterface:
                 explicit=False,  # optional
                 additional=[],  # optional, used to convey more info when using orpheus.py search (not luckysearch, for obvious reasons)
                 extra_kwargs={
-                    "data": {i["id"]: i}
+                    "data": {f"{i['id']}_search": i}
                 }  # optional, whatever you want. NOTE: BE CAREFUL! this can be given to:
                 # get_track_info, get_album_info, get_artist_info with normal search results, and
                 # get_track_credits, get_track_cover, get_track_lyrics in the case of other modules using this module just for those.
@@ -517,6 +533,8 @@ class ModuleInterface:
             )
             for i in results
         ]
+    
+    # helpers
 
     @staticmethod
     def _get_date_from_metadata(album_data: dict[str, typing.Any]):
@@ -569,10 +587,7 @@ class ModuleInterface:
                 ):
                     key_id = str(content_property.get("@cenc:default_KID"))
                     continue
-                # if (
-                #     content_property.get("schemeIdUri")
-                #     == "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
-                # )
+
                 # NOTE might need to use xmltodict instead of xml.etree.ElementTree
                 if content_property.get("@schemeIdUri") == "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed":
                     LOGGER.debug(f"Chosen: {adaptation_set}")
