@@ -162,7 +162,7 @@ class AmazonMusicMobileAPI:
         )
 
         # authorization_code = self._internal_login(self, oauth_url, email, password)
-        authorization_code = self._exteral_login(oauth_url)
+        authorization_code = self._exteral_login(oauth_url, application)
         
         print(f"Login confirmed for {email} on {application.official_name}")
 
@@ -1351,8 +1351,22 @@ class AmazonMusicMobileAPI:
                 "To force refresh please use force=True"
             )
 
-    def _exteral_login(self, oauth_url: str):
-        response_url = httpx.URL(default_login_url_callback(oauth_url))
+    def _exteral_login(self, oauth_url: str, application: AmazonMobileApplication):
+        print(
+            "Please copy the following url and insert it in a web browser of "
+            "your choice:"
+            f"\n{oauth_url}\n"
+            "Now you have to login with your Amazon credentials. After submit "
+            "your username and password you have to do this a second time "
+            "and solving a captcha before sending the login form.\n"
+            "After login, your browser will show you a error page (not found). "
+            "Do not worry about this. It has to be like this. Please copy the url from the address bar in your browser now.\n"
+            f"\nNOTE: You are currently logging into {application.official_name!r}, as it is required."
+        )
+
+        callback_url = input("Please insert the copied url (after login):\n")
+        
+        response_url = httpx.URL(callback_url)
         parsed_url = parse_qs(response_url.query.decode())
 
         authorization_code = parsed_url["openid.oa2.authorization_code"][0]

@@ -256,15 +256,22 @@ class ModuleInterface:
                 if track_to_use is not None:
                     break
                 
-            # track_to_use = avaliable_tracks[0] # avaliable_tracks[-1] #avaliable_tracks[0]
             LOGGER.debug(f"Using AudioTrack: {track_to_use}")
             
+            # Amazon Music doesn't have any "Disc" seperation, so it is typically assumed to be 1 however:
             disc_total = max(int(t['discNum']) for t in album_data.get('tracks', [{}]))
             composers = "; ".join(
                 natsort.natsorted(
                     track_data.get("songWriters", [album_data["primaryArtistName"]])
                 )
             )
+            comment = f"https://music.amazon.{self.mobile_session.credentials.tld}/albums/{album_id}"
+
+            extra_tags = {
+                "Merchant": " ".join(str(album_data["productDetails"]["merchantName"]).split()),
+                "Composer": composers, # force set the composer tag, because orpheus doesn't handle it
+            }
+
             tags = Tags(  # every single one of these is optional
                 album_artist=album_data["primaryArtistName"],
                 composer=composers,
@@ -280,11 +287,8 @@ class ModuleInterface:
                 genres=[album_data["productDetails"]["primaryGenreName"]],
                 label=album_data["productDetails"]["label"],
                 release_date=release_datetime.strftime("%Y-%m-%d"),  # Format: YYYY-MM-DD
-                comment=f"https://music.amazon.{self.mobile_session.credentials.tld}/albums/{album_id}",
-                extra_tags={
-                    "Merchant": " ".join(str(album_data["productDetails"]["merchantName"]).split()),
-                    "Composer": composers # force set the composer tag, because orpheus doesn't handle it
-                }
+                comment=comment,
+                extra_tags=extra_tags
             )
 
             return TrackInfo(
