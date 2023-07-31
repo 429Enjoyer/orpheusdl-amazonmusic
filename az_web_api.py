@@ -181,7 +181,7 @@ class AmazonWebAPI:
            url=url,
            headers=headers 
         )
-        print(opt_resp.cookies)
+
         headers = headers | {"Cookie": opt_resp.cookies.get("AWSALB")}
         # self.mobile_app_credentials.access_token
 

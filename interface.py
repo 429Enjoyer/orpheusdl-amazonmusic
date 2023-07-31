@@ -382,7 +382,7 @@ class ModuleInterface:
         self, album_id: str, data={}
     ) -> Optional[AlbumInfo]:  # Mandatory if ModuleModes.download
         # raise NotImplementedError
-        LOGGER.debug("getting album info")
+        LOGGER.debug("Getting album info")
 
         try:
             album_data = (
@@ -390,12 +390,15 @@ class ModuleInterface:
                 if album_id in data
                 else self.mobile_session.get_album_info(album_id)
             )
+            # Force use the ASIN the API returns with
+            album_id = album_data["asin"]
             search_data = (
                 data[f"{album_id}_search"]
                 if data and f"{album_id}_search" in data
                 else self.mobile_session.search(
                     query=f"{album_data['artist']['name']} - {album_data['title']}",
-                    asin=album_id
+                    asin=album_id,
+                    limit=100
                 )
             )
             ai = AlbumInfo(
@@ -417,7 +420,7 @@ class ModuleInterface:
             LOGGER.debug(ai)
             return ai
         except Exception as e:
-            LOGGER.error(e)
+            LOGGER.error(e, exc_info=1)
 
     def get_playlist_info(
         self, playlist_id: str, data={}
