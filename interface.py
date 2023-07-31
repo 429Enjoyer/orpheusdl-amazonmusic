@@ -268,7 +268,9 @@ class ModuleInterface:
             comment = f"https://music.amazon.{self.mobile_session.credentials.tld}/albums/{album_id}"
 
             extra_tags = {
-                "Merchant": " ".join(str(album_data["productDetails"]["merchantName"]).split()),
+                "Merchant": " ".join(str(album_data["productDetails"]["merchantName"]).split())
+                if album_data.get("productDetails", {}).get("merchantName")
+                else None,
                 "Composer": composers, # force set the composer tag, because orpheus doesn't handle it
             }
 
@@ -290,6 +292,12 @@ class ModuleInterface:
                 comment=comment,
                 extra_tags=extra_tags
             )
+            
+            artwork_url = search_data['artOriginal']['artUrl']
+            # if self.mobile_session.country_code == "AU":
+            #     # specific error with AU, httpcore.ConnectError: [Errno -2] Name or service not known
+            #     # Not sure how this happens
+            #     artwork_url = None
 
             return TrackInfo(
                 name=track_data["title"],
@@ -298,7 +306,7 @@ class ModuleInterface:
                 artists=[album_data["artist"]["name"]],
                 tags=tags,
                 codec=track_to_use.codec,
-                cover_url=search_data['artOriginal']['artUrl'],  # make sure to check module_controller.orpheus_options.default_cover_options
+                cover_url=artwork_url,  # make sure to check module_controller.orpheus_options.default_cover_options
                 release_year=release_datetime,
                 explicit=track_data["parentalControls"]["hasExplicitLanguage"],
                 artist_id=track_data["artist"]["asin"],  # optional

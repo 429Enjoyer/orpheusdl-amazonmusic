@@ -232,6 +232,7 @@ class AmazonMusicMobileAPI:
                 resp = self.session.send(request)
                 return resp
             except httpx.ConnectError as ce:
+                time.sleep(5)
                 LOGGER.error(ce, exc_info=1)
                 continue
         return
@@ -710,20 +711,23 @@ class AmazonMusicMobileAPI:
         """
         Comedically long function name
         """
+        for document in self.get_documents_from_search_results(results):
+            asins = [
+                str(document.get(item))
+                for item in ("albumAsin", "artistAsin", "asin")
+                if document.get(item)
+            ]
+            if asin not in asins:
+                continue
+            return document
+        return
+    
+    def get_documents_from_search_results(self, results: dict):
         for category in results:
             if int(category['totalHitCount']) == 0:
                 continue
             for hit in category['hits']:
-                document = dict(hit['document'])
-                asins = [
-                   str(document.get(item))
-                   for item in ("albumAsin", "artistAsin", "asin")
-                   if document.get(item)
-                ]
-                if asin not in asins:
-                    continue
-                return document
-        return
+                yield dict(hit['document'])
 
     def register(
         self,
@@ -940,7 +944,7 @@ class AmazonMusicMobileAPI:
             "disableLoginPrepopulate": "0",
             "openid.ns": "http://specs.openid.net/auth/2.0",
             "forceMobileLayout": "true",  # custom, unsure if required by azm or is useless
-            "marketPlaceId": market_place_id,  # custom, unsure if required by azm or is useless
+            # "marketPlaceId": market_place_id,  # custom, unsure if required by azm or is useless
         }
 
         return f"{base_url}?{urlencode(oauth_params)}", serial
@@ -1490,6 +1494,7 @@ class AmazonMusicMobileAPI:
         # this is retrieved from the Amazon Music android app
         # NOTE: this can be retrived by parsing the appConfig from the root on the netloc 
         # marketplace ID for amazon prime video: ART4WZ8MWBX2Y
+        print(country_code)
         return {
             "US": "ATVPDKIKX0DER",
             "JP": "A1VC38T7YXB528",
