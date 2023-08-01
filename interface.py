@@ -268,11 +268,10 @@ class ModuleInterface:
             comment = f"https://music.amazon.{self.mobile_session.credentials.tld}/albums/{album_id}"
 
             extra_tags = {
-                "Merchant": " ".join(str(album_data["productDetails"]["merchantName"]).split())
-                if album_data.get("productDetails", {}).get("merchantName")
-                else None,
                 "Composer": composers, # force set the composer tag, because orpheus doesn't handle it
             }
+            if album_data.get("productDetails", {}).get("merchantName"):
+                extra_tags.update({"Merchant": " ".join(str(album_data["productDetails"]["merchantName"]).split())})
 
             tags = Tags(  # every single one of these is optional
                 album_artist=album_data["primaryArtistName"],

@@ -229,6 +229,7 @@ class AmazonMusicMobileAPI:
         while attempt <= 5:
             attempt += 1
             try:
+                LOGGER.debug("Handling request: %s", request)
                 resp = self.session.send(request)
                 return resp
             except httpx.ConnectError as ce:
@@ -525,9 +526,19 @@ class AmazonMusicMobileAPI:
             `asin`: The track asin.
             `marketplaceId`: The ID of the marketplace.
         """
+        tld = self.credentials.tld
+        if self.credentials.tld not in ("co.jp", "com"):
+            if self.credentials.customer_info['home_region'] == "FE":
+                tld = "co.jp"
+            elif self.credentials.customer_info['home_region'] == "NA":
+                tld = "com"
+            else:
+                print("Warning! This type of TLD is not recognized, \n"
+                      "You are LIKELY to encounter an error. \n"
+                      f"URL: https://music-xray-service.amazon.{tld}/")
 
         response = self.post(
-            url=f"https://music-xray-service.amazon.{self.credentials.tld}/",
+            url=f"https://music-xray-service.amazon.{tld}/",
             headers={
                 "User-Agent": self.APP_USER_AGENT,
                 "x-amz-target": "com.amazon.musicxray.MusicXrayService.getLyricsByTrackAsinBatch",
