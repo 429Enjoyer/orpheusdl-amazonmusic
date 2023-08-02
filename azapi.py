@@ -159,6 +159,7 @@ class AmazonMusicMobileAPI:
             application=application,
             serial=serial,
             region="na",
+            country_code=country_code
         )
 
         # authorization_code = self._internal_login(self, oauth_url, email, password)
@@ -231,11 +232,14 @@ class AmazonMusicMobileAPI:
             try:
                 LOGGER.debug("Handling request: %s", request)
                 resp = self.session.send(request)
-                return resp
-            except httpx.ConnectError as ce:
+                resp.raise_for_status()
+            except httpx.HTTPError as ce:
                 time.sleep(5)
                 LOGGER.error(ce, exc_info=1)
                 continue
+            else:
+                # return the response if successful
+                return resp
         return
 
     def post(
@@ -915,11 +919,12 @@ class AmazonMusicMobileAPI:
     @staticmethod
     def _build_oauth_url(
         domain: str,
-        market_place_id: str,
         code_verifier: bytes,
         application: AmazonMobileApplication,
-        region: Optional[str] = None,
+        market_place_id: str,
+        country_code: str,
         serial: Optional[str] = None,
+        region: Optional[str] = None,
         assoc_handle: Optional[str] = None
     ) -> tuple[str, str]:
         """Builds the url to login to Amazon Music."""
@@ -955,8 +960,13 @@ class AmazonMusicMobileAPI:
             "disableLoginPrepopulate": "0",
             "openid.ns": "http://specs.openid.net/auth/2.0",
             "forceMobileLayout": "true",  # custom, unsure if required by azm or is useless
-            # "marketPlaceId": market_place_id,  # custom, unsure if required by azm or is useless
         }
+        if country_code in ["JP"]:
+            # TODO, find which countries that require to login into prime video first
+            # NOTE: amz music australia hates the marketplace id in the oauth url
+            oauth_params.update({
+                "marketPlaceId": market_place_id
+            })
 
         return f"{base_url}?{urlencode(oauth_params)}", serial
 
