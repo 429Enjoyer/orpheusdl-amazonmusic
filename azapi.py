@@ -4,6 +4,7 @@ import json
 import logging
 import logging.handlers
 import math
+import os
 import re
 import secrets
 import time
@@ -19,18 +20,29 @@ import httpx
 import rsa
 import rsa.pkcs1
 import xmltodict
+
 # from audible import Authenticator, Client, localization
 # from audible.auth import sign_request
-from audible.login import (build_device_serial, check_for_approval_alert,
-                           check_for_captcha, check_for_choice_mfa,
-                           check_for_cvf, check_for_mfa, create_code_verifier,
-                           create_s256_code_challenge,
-                           default_approval_alert_callback,
-                           default_captcha_callback, default_cvf_callback,
-                           default_login_url_callback, default_otp_callback,
-                           extract_captcha_url, extract_code_from_url,
-                           get_inputs_from_soup, get_next_action_from_soup,
-                           get_soup)
+from audible.login import (
+    build_device_serial,
+    check_for_approval_alert,
+    check_for_captcha,
+    check_for_choice_mfa,
+    check_for_cvf,
+    check_for_mfa,
+    create_code_verifier,
+    create_s256_code_challenge,
+    default_approval_alert_callback,
+    default_captcha_callback,
+    default_cvf_callback,
+    default_login_url_callback,
+    default_otp_callback,
+    extract_captcha_url,
+    extract_code_from_url,
+    get_inputs_from_soup,
+    get_next_action_from_soup,
+    get_soup,
+)
 from audible.metadata import encrypt_metadata
 from bs4 import BeautifulSoup
 from Crypto.PublicKey import RSA
@@ -40,6 +52,7 @@ from .az_web_api import AmazonWebAPI
 
 LOGGER = logging.getLogger(__name__)
 
+
 class APIError(Exception):
     def __init__(self, type, msg, payload):
         self.type = type
@@ -48,12 +61,13 @@ class APIError(Exception):
 
     def __str__(self):
         return ", ".join((self.type, self.msg, str(self.payload)))
-    
+
+
 class AmazonMobileApplication(Enum):
     MUSIC = auto()
     PRIME_VIDEO = auto()
     SHOPPING = auto()
-    
+
     @property
     def device_type(self):
         return {
@@ -61,14 +75,14 @@ class AmazonMobileApplication(Enum):
             self.PRIME_VIDEO: "A43PXU4ZN2AL1",
             self.SHOPPING: "A1MPSLFC7L5AFK",
         }[self]
-        
+
     @property
     def assoc_handle(self):
         return {
             self.MUSIC: "amzn_tiburon_na",
             self.PRIME_VIDEO: "amzn_piv_android_v2_us",
         }[self]
-        
+
     @property
     def official_name(self):
         return {
@@ -76,7 +90,7 @@ class AmazonMobileApplication(Enum):
             self.PRIME_VIDEO: "Amazon Prime Video",
             self.SHOPPING: "Amazon Shopping",
         }[self]
-    
+
 
 class AmazonMusicMobileAPI:
     """Amazon Music API"""
@@ -117,11 +131,13 @@ class AmazonMusicMobileAPI:
             self.session.cookies.update(credentials.website_cookies)
         else:
             self.credentials = None
-            
+
         if len(country_code) != 2:
-            raise ValueError(f"Country code must be a ISO 3166-1 alpha-2 value!, got: {country_code}")
+            raise ValueError(
+                f"Country code must be a ISO 3166-1 alpha-2 value!, got: {country_code}"
+            )
         self.country_code = country_code
-        
+
         return
 
     def login_via_mobile(
@@ -132,16 +148,20 @@ class AmazonMusicMobileAPI:
         country_code: str = "US",
         serial: Optional[str] = None,
         load_credentials: Optional[bool] = True,
-        application: Optional[AmazonMobileApplication] = None
+        application: Optional[AmazonMobileApplication] = None,
     ):
-
         if self.credentials:
-            LOGGER.info("Already logged in")
+            LOGGER.error("Already logged in")
             return
         if country_code == "JP":
             # Login to Prime Video first, because amazon.
-            self.login_via_mobile(email=email, password=password, load_credentials=False, application=AmazonMobileApplication.PRIME_VIDEO)
-            
+            self.login_via_mobile(
+                email=email,
+                password=password,
+                load_credentials=False,
+                application=AmazonMobileApplication.PRIME_VIDEO,
+            )
+
         application = application or AmazonMobileApplication.MUSIC
 
         base_url = f"https://amazon.{domain}"
@@ -159,12 +179,12 @@ class AmazonMusicMobileAPI:
             application=application,
             serial=serial,
             region="na",
-            country_code=country_code
+            country_code=country_code,
         )
 
         # authorization_code = self._internal_login(self, oauth_url, email, password)
         authorization_code = self._exteral_login(oauth_url, application)
-        
+
         print(f"Login confirmed for {email} on {application.official_name}")
 
         items = {
@@ -173,10 +193,10 @@ class AmazonMusicMobileAPI:
             "domain": domain,
             "serial": serial,
         }
-        
+
         if not load_credentials:
             return True
-        
+
         self.credentials = self.register(application=application, **items)
 
         # check home data, not required
@@ -218,14 +238,14 @@ class AmazonMusicMobileAPI:
         # TODO add a check if too many devices are registered, and if so, notify the user and add a way to remove devices via a prompt
         # get devices
         self._list_devices()
-        
+
         if self.credentials:
             return self.credentials
 
         raise Exception("Login failed. Please check the log.")
-    
+
     def _wait_for_response(self, request: httpx.Request):
-        # Sometimes we get a DNS resolve error (too many requests for manifest?), this attempts to retry 5 times 
+        # Sometimes we get a DNS resolve error (too many requests for manifest?), this attempts to retry 5 times
         attempt = 0
         while attempt <= 5:
             attempt += 1
@@ -234,8 +254,9 @@ class AmazonMusicMobileAPI:
                 resp = self.session.send(request)
                 resp.raise_for_status()
             except httpx.HTTPError as ce:
-                time.sleep(5)
-                LOGGER.error(ce, exc_info=1)
+                time.sleep(10)
+                LOGGER.error(ce)
+                LOGGER.debug(ce, exc_info=1)
                 continue
             else:
                 # return the response if successful
@@ -243,7 +264,11 @@ class AmazonMusicMobileAPI:
         return
 
     def post(
-        self, url: str, data: dict | None, headers: Optional[dict] = None, sign: Optional[bool] = True
+        self,
+        url: str,
+        data: dict | None,
+        headers: Optional[dict] = None,
+        sign: Optional[bool] = True,
     ) -> httpx.Response:
         # these headers assume that the url is https://music.amazon.com/NA/api/stratus/
         # TODO have a enum representing the the api endpoints for the different headers
@@ -269,7 +294,6 @@ class AmazonMusicMobileAPI:
             self._apply_signing_auth_flow(request)
         self._apply_cookies_auth_flow(request)
         return self._wait_for_response(request)
-            
 
     def get(self, url: str, headers: Optional[dict] = None) -> httpx.Response:
         d_headers = {
@@ -277,21 +301,24 @@ class AmazonMusicMobileAPI:
             "X-Amz-RequestId": str(uuid.uuid4()),
         }
         request = httpx.Request(
-            "GET", url, cookies=self.credentials.website_cookies, headers=d_headers | headers
+            "GET",
+            url,
+            cookies=self.credentials.website_cookies,
+            headers=d_headers | headers,
         )
         # self._apply_signing_auth_flow(request)
         self._apply_cookies_auth_flow(request)
         return self._wait_for_response(request)
-    
+
     def get_root(self, tld: typing.Optional[str] = None):
         """
         Get the response of the root URL of Amazon Music.
-        
+
         Useful for parsing the web app configuration.
         """
         return self.session.get(
             url=f"https://music.amazon.{tld or self.credentials.tld}/",
-            headers={"User-Agent": self.USER_AGENT}
+            headers={"User-Agent": self.USER_AGENT},
         ).text
 
     def get_metadata(
@@ -306,16 +333,16 @@ class AmazonMusicMobileAPI:
         Album ASIN -> `response.json()['albumsList'][0]`
 
         Artist ASIN -> `response.json()['artistList'][0]`
-        
+
         ## List of avaliable features:
         [fullAlbumDetails, playlistLibraryAvailability, disableSubstitution, childParentOwnership, trackLibraryAvailability,
         hasLyrics, ownership, expandTracklist, includeVideo, requestAudioVideo, popularity, albumArtist, collectionLibraryAvailability,
         includePurchaseDetails, editorialAssociations]
         """
-        #TODO figure out how to get avaliable qualities through this api (see mobile and web requests to get what i mean)
+        # TODO figure out how to get avaliable qualities through this api (see mobile and web requests to get what i mean)
         # Valid keywords to Amazon JP (unknown)
         # objectId,fileName,fileExtension,fileSize,creationDate,lastUpdatedDate,orderId,asin,purchaseDate,localFilePath,md5,status,purchased,uploaded,title,sortTitle,rating,marketplace,physicalOrderId,assetType,artistName,artistAsin,contributors,trackNum,discNum,primaryGenre,duration,bitrate,composer,songWriter,performer,lyricist,publisher,errorCode,instantImport,primeStatus,isMusicSubscription,albumName,albumAsin,albumArtistName,albumArtistAsin,albumContributors,albumRating,albumPrimaryGenre,albumReleaseDate,sortArtistName,sortAlbumName,sortAlbumArtistName,audioUpgradeDate,parentalControls,assetEligibility,eligibility,internalTags
-        
+
         asins = [asins] if isinstance(asins, str) else list(asins)
         response = self.post(
             url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.customer_info['home_region']}/api/muse/",
@@ -345,12 +372,12 @@ class AmazonMusicMobileAPI:
                     "editorialAssociations",
                     "trackLibraryAvailability",
                     "collectionLibraryAvailability",
-                    "playlistLibraryAvailability"
+                    "playlistLibraryAvailability",
                 ],
                 "filters": None,
                 "lang": "en_US",  # en_US i wonder if ja_JP would work for japanese | No it doesn't
                 "marketplaceId": None,
-                "metadataLang": "", #ja_JP for tagging in japanese, blank for locale
+                "metadataLang": "",  # ja_JP for tagging in japanese, blank for locale
                 "musicRequestIdentityContextToken": None,
                 "musicTerritory": self.country_code,
                 "requestedContent": "ALL_STREAMABLE",
@@ -366,19 +393,25 @@ class AmazonMusicMobileAPI:
         LOGGER.debug(json.dumps(resp_json, indent=2))
         return resp_json
 
-    def search(self, query: str, asin: typing.Optional[str] = None, search_types: typing.Optional[typing.Iterable] = None, limit: typing.Optional[int] = 50):
+    def search(
+        self,
+        query: str,
+        asin: typing.Optional[str] = None,
+        search_types: typing.Optional[typing.Iterable] = None,
+        limit: typing.Optional[int] = 50,
+    ):
         """
         Search for a item using a query.
-        
+
         Args:
             asin: str (Optional): To return only the item in which the ASIN is included.
             search_types: Iterable (Optional): Search for a specific catalog type.
-            
+
             Valid types are:
             `catalog_album, catalog_artist, catalog_playlist, catalog_station,
             catalog_track, livesports_program, catalog_video, catalog_video_playlist,
             catalog_podcast_show, catalog_podcast_episode, live_event`
-            
+
         """
 
         url = f"https://music.amazon.{self.credentials.tld}/{self.credentials.customer_info['home_region']}/api/textsearch/search/v1_1/"
@@ -388,21 +421,15 @@ class AmazonMusicMobileAPI:
             "X-Amz-Requestid": str(uuid.uuid4()).lower(),
         }
         if search_types is None:
-            search_types = [
-                "catalog_album"
-            ]
-        
+            search_types = ["catalog_album"]
+
         result_specs = [
             {
                 "contentRestrictions": {
-                    "allowedParentalControls": {
-                        "hasExplicitLanguage": True
-                    },
-                    "assetQuality": {
-                        "quality": []
-                    },
+                    "allowedParentalControls": {"hasExplicitLanguage": True},
+                    "assetQuality": {"quality": []},
                     "contentTier": "UNLIMITED",
-                    "eligibility": None
+                    "eligibility": None,
                 },
                 "documentSpecs": [
                     {
@@ -411,59 +438,53 @@ class AmazonMusicMobileAPI:
                             "parentalControls.hasExplicitLanguage",
                             "contentTier",
                             "artOriginal",
-                            "contentEncoding"
+                            "contentEncoding",
                         ],
                         "filters": None,
-                        "type": label_type
+                        "type": label_type,
                     }
                 ],
                 "label": label_type,
                 "maxResults": limit,
                 "pageToken": None,
-                "topHitSpec": None
+                "topHitSpec": None,
             }
             for label_type in search_types
         ]
-        
+
         data = {
             "customerIdentity": {
                 "customerId": self.credentials.customer_id,
                 "deviceId": self.credentials.device_info["device_serial_number"],
                 "deviceType": AmazonMobileApplication.MUSIC.device_type,
                 "musicRequestIdentityContextToken": None,
-                "sessionId": "123-1234567-5555555" # this is legit what the app uses :skull:
+                "sessionId": "123-1234567-5555555",  # this is legit what the app uses :skull:
             },
             "explain": None,
             "features": {
                 "spellCorrection": {
                     "accepted": None,
                     "allowCorrection": True,
-                    "rejected": None
+                    "rejected": None,
                 },
                 "spiritual": None,
-                "upsell": {
-                    "allowUpsellForCatalogContent": False
-                }
+                "upsell": {"allowUpsellForCatalogContent": False},
             },
-            "locale": "en_US", # TODO use custom locale
+            "locale": "en_US",  # TODO use custom locale
             "musicTerritory": self.country_code,
             "query": query,
             "queryMetadata": None,
-            "resultSpecs": result_specs
+            "resultSpecs": result_specs,
         }
-        
-        response = self.post(
-            url=url,
-            headers=headers,
-            data=data
-        )
+
+        response = self.post(url=url, headers=headers, data=data)
         resp_json = response.json()
         LOGGER.debug(resp_json)
         results = resp_json.get("results", {})
         if not asin:
             return results
         return self.find_item_by_asin_in_search_results(results, asin)
-    
+
     def get_recent_tracks(self):
         """
         Get the logged in user's recent tracks.
@@ -480,29 +501,20 @@ class AmazonMusicMobileAPI:
             "customerId": None,
             "deviceId": self.credentials.device_info["device_serial_number"],
             "deviceType": AmazonMobileApplication.MUSIC.device_type,
-            "features": [
-                "HIGHQUALITY"
-            ],
+            "features": ["HIGHQUALITY"],
             "languageLocale": None,
             "marketplaceId": None,
             "musicRequestIdentityContext": None,
             "musicRequestIdentityContextToken": None,
             "musicTerritory": self.country_code,
-            "pageToken": ""
+            "pageToken": "",
         }
-        resp = self.post(
-            url=url,
-            headers=headers,
-            data=data,
-            sign=True
-        )
-        
+        resp = self.post(url=url, headers=headers, data=data, sign=True)
+
         print(json.dumps(resp.json(), indent=3))
         return resp.json()
 
-    def get_track_lyrics(
-        self, track_asin: str
-    ) -> dict[str, Any]:
+    def get_track_lyrics(self, track_asin: str) -> dict[str, Any]:
         """
         Get the lyrics for a track.
 
@@ -532,14 +544,16 @@ class AmazonMusicMobileAPI:
         """
         tld = self.credentials.tld
         if self.credentials.tld not in ("co.jp", "com"):
-            if self.credentials.customer_info['home_region'] == "FE":
+            if self.credentials.customer_info["home_region"] == "FE":
                 tld = "co.jp"
-            elif self.credentials.customer_info['home_region'] == "NA":
+            elif self.credentials.customer_info["home_region"] == "NA":
                 tld = "com"
             else:
-                print("Warning! This type of TLD is not recognized, \n"
-                      "You are LIKELY to encounter an error. \n"
-                      f"URL: https://music-xray-service.amazon.{tld}/")
+                print(
+                    "Warning! This type of TLD is not recognized, \n"
+                    "You are LIKELY to encounter an error. \n"
+                    f"URL: https://music-xray-service.amazon.{tld}/"
+                )
 
         response = self.post(
             url=f"https://music-xray-service.amazon.{tld}/",
@@ -566,7 +580,7 @@ class AmazonMusicMobileAPI:
 
         Returns:
         The Amazon Music Dash Manifest as a `xml.etree.ElementTree`
-        
+
         TRACK_PSSH + SIREN_KATANA = All audio format (Lossless and 360).
         TRACK_PSSH + SIREN_KATANA_NO_CLEAR_LEAD = No issues, only up to lossless
         """
@@ -606,7 +620,7 @@ class AmazonMusicMobileAPI:
                 },
                 "musicDashVersionList": [
                     # "SIREN", #untested
-                    "SIREN_KATANA", #with 360 audio, but keeps on getting invalid key size (with group_pssh)? PSSH Entitled key size is always 32 bytes, not sure why (brings error if used)
+                    "SIREN_KATANA",  # with 360 audio, but keeps on getting invalid key size (with group_pssh)? PSSH Entitled key size is always 32 bytes, not sure why (brings error if used)
                     # "SIREN_KATANA_NO_CLEAR_LEAD", #this and no entitlement, is what is used by Amazon Music Web
                 ],
                 # "try3dAsinSubstitution": True,
@@ -635,7 +649,7 @@ class AmazonMusicMobileAPI:
     # Shortcuts
 
     def get_track_info(self, track_asin: str):
-        resp = self.get_metadata(track_asin)['trackList']
+        resp = self.get_metadata(track_asin)["trackList"]
         if len(resp) > 1:
             raise Exception("Failed to get track manifest: tracklist is greater than 1")
         return resp[0]
@@ -651,7 +665,6 @@ class AmazonMusicMobileAPI:
         Do not use this function.
         It does not work, unless you have the right System ID required.
         """
-        # NOTE don't understand why it posts twice to the same endpoint
         self.refresh_access_token(force=True)
         # print(self.credentials.access_token)
         # print(self.credentials.website_cookies)
@@ -659,7 +672,7 @@ class AmazonMusicMobileAPI:
             # url="https://music.amazon.com/NA/api/dmls/getLicenseForPlaybackV2",
             url="https://music.amazon.com/NA/api/dmls/",
             data={
-                "DrmType": "WIDEVINE_ENTITLEMENT", # entitlement is not possible without the proper widevine device (9480)
+                "DrmType": "WIDEVINE_ENTITLEMENT",  # entitlement is not possible without the proper widevine device (9480)
                 # "DrmType": "WIDEVINE"
                 "appInfo": {
                     "musicAgent": f"Harley/{self.harley_version} Harley/{self.application_version} ( {str(uuid.uuid4())} {asin} )"
@@ -680,17 +693,21 @@ class AmazonMusicMobileAPI:
                 "Referer": "https://music.amazon.com/",
             },
         )
-        
+
         if response.status_code != 200:
-            raise Exception(f"Failed to get license: {response.status_code} {response.text}")
+            raise Exception(
+                f"Failed to get license: {response.status_code} {response.text}"
+            )
 
-        return response.json()['license']
+        return response.json()["license"]
 
-    def get_album_page(self, asin: str):
+    def get_artist_page(self, asin: str):
         response = self.post(
-            url=f"https://{str(self.credentials.customer_info['home_region']).lower()}.mobilemesk.skill.music.a2z.com/api/showCatalogAlbum",
+            url=f"https://{str(self.credentials.customer_info['home_region']).lower()}.mobilemesk.skill.music.a2z.com/api/showCatalogArtist",
             headers={
-                "x-amzn-device-id": self.credentials.device_info["device_serial_number"],
+                "x-amzn-device-id": self.credentials.device_info[
+                    "device_serial_number"
+                ],
                 "x-amzn-device-family": "MobileAndroid",
                 "x-amzn-device-manufacturer": "Google",
                 "x-amzn-device-model": "Pixel 5",
@@ -704,22 +721,27 @@ class AmazonMusicMobileAPI:
                 "x-amzn-timestamp": f"{time.time_ns() // 1_000_000}",
                 "x-amzn-user-agent": "MusicAndroid/23.7.0",
                 "x-amzn-device-type-id": AmazonMobileApplication.MUSIC.device_type,
-                "x-amzn-request-id": str(uuid.uuid4()),
-                "x-amzn-authentication": json.dumps({"interface":"ClientAuthenticationInterface.v1_0.ClientTokenElement","accessToken":f"{self.credentials.access_token}"}),
-                "x-amzn-session-id": self.credentials.website_cookies['session-id'],
-                "x-amzn-feature-flags": "", #includeArtistRefinements
+                "x-amzn-request-id": str(uuid.uuid4()).lower(),
+                "x-amzn-authentication": json.dumps(
+                    {
+                        "interface": "ClientAuthenticationInterface.v1_0.ClientTokenElement",
+                        "accessToken": f"{self.credentials.access_token}",
+                    }
+                ),
+                "x-amzn-session-id": self.credentials.website_cookies["session-id"],
+                "x-amzn-feature-flags": "",  # includeArtistRefinements
                 "content-type": "application/json; charset=utf-8",
                 "accept-encoding": "gzip",
                 "user-agent": "okhttp/4.10.0",
             },
             data={
-                "id": asin
-            }
+                "id": asin,
+            },
         )
         # "libraryArtistId": "-1"
         LOGGER.debug(json.dumps(response.json(), indent=3))
-        print(json.dumps(response.json(), indent=3))
-        
+        # print(json.dumps(response.json(), indent=3))
+
         return response.json()
 
     def find_item_by_asin_in_search_results(self, results: dict, asin: str):
@@ -736,13 +758,13 @@ class AmazonMusicMobileAPI:
                 continue
             return document
         return
-    
+
     def get_documents_from_search_results(self, results: dict):
         for category in results:
-            if int(category['totalHitCount']) == 0:
+            if int(category["totalHitCount"]) == 0:
                 continue
-            for hit in category['hits']:
-                yield dict(hit['document'])
+            for hit in category["hits"]:
+                yield dict(hit["document"])
 
     def register(
         self,
@@ -750,7 +772,7 @@ class AmazonMusicMobileAPI:
         code_verifier: bytes,
         domain: str,
         serial: str,
-        application: AmazonMobileApplication
+        application: AmazonMobileApplication,
     ):
         """Registers a dummy Amazon device for Amazon Music.
 
@@ -769,7 +791,7 @@ class AmazonMusicMobileAPI:
             LOGGER.warning("Already registered, returning existing credentials")
             return self.credentials
 
-        device_name = f"ripperino {uuid.uuid1()} - Android Device (MP3)"
+        device_name = f"ripperino {os.urandom(16).hex()} - Android Device (MP3)"
         LOGGER.debug(f"Registering device {device_name} with serial {serial}")
 
         body = {
@@ -835,13 +857,13 @@ class AmazonMusicMobileAPI:
         extensions = success_response["extensions"]
         device_info = dict(extensions["device_info"])
         customer_info = dict(extensions["customer_info"])
-        
+
         # Confirm home region is valid
-        
+
         app_config = AmazonWebAPI.parse_for_app_config(self.get_root(domain))
         if app_config is not None:
-            if customer_info["home_region"] != app_config['siteRegion']:
-                customer_info.update({"home_region": str(app_config['siteRegion'])})
+            if customer_info["home_region"] != app_config["siteRegion"]:
+                customer_info.update({"home_region": str(app_config["siteRegion"])})
 
         website_cookies = {
             cookie["Name"]: str(cookie["Value"]).replace(r'"', r"")
@@ -874,7 +896,9 @@ class AmazonMusicMobileAPI:
         return self.credentials
 
     @staticmethod
-    def _build_client_id(serial: str, app: Optional[AmazonMobileApplication] = None) -> str:
+    def _build_client_id(
+        serial: str, app: Optional[AmazonMobileApplication] = None
+    ) -> str:
         if app is not None:
             device_type = app.device_type
         else:
@@ -925,7 +949,7 @@ class AmazonMusicMobileAPI:
         country_code: str,
         serial: Optional[str] = None,
         region: Optional[str] = None,
-        assoc_handle: Optional[str] = None
+        assoc_handle: Optional[str] = None,
     ) -> tuple[str, str]:
         """Builds the url to login to Amazon Music."""
 
@@ -964,9 +988,7 @@ class AmazonMusicMobileAPI:
         if country_code in ["JP"]:
             # TODO, find which countries that require to login into prime video first
             # NOTE: amz music australia hates the marketplace id in the oauth url
-            oauth_params.update({
-                "marketPlaceId": market_place_id
-            })
+            oauth_params.update({"marketPlaceId": market_place_id})
 
         return f"{base_url}?{urlencode(oauth_params)}", serial
 
@@ -1227,7 +1249,7 @@ class AmazonMusicMobileAPI:
         # LOGGER.debug(headers)
 
         request.headers.update(headers)
-        LOGGER.info("signing auth flow applied to request")
+        LOGGER.debug("signing auth flow applied to request")
 
     def _apply_cookies_auth_flow(self, request: httpx.Request) -> None:
         if not self.credentials:
@@ -1237,7 +1259,7 @@ class AmazonMusicMobileAPI:
         }
 
         httpx.Cookies(cookies).set_cookie_header(request)
-        LOGGER.info("cookies auth flow applied to request")
+        LOGGER.debug("cookies auth flow applied to request")
 
     def _list_devices(self):
         devices_resp = self.post(
@@ -1312,22 +1334,20 @@ class AmazonMusicMobileAPI:
             f"{auth_device_resp.status_code} {json.dumps(auth_device_resp_json, indent=4)}"
         )
         return auth_device_resp
-    
+
     def _retrieve_capability(self):
         response = self.post(
             url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.customer_info['home_region']}/api/stratus/",
             headers={
-                'x-amz-target': 'com.amazon.stratus.StratusServiceExternal.retrieveCapability',
-                'x-amzn-requestid': str(uuid.uuid4())
+                "x-amz-target": "com.amazon.stratus.StratusServiceExternal.retrieveCapability",
+                "x-amzn-requestid": str(uuid.uuid4()),
             },
             data={
-                "capabilityTypes": [
-                    "RETRIEVE_ROBIN_CONTENT"    
-                ],
+                "capabilityTypes": ["RETRIEVE_ROBIN_CONTENT"],
                 "customerId": None,
-                "deviceId": self.credentials.device_info['device_serial_number'],
+                "deviceId": self.credentials.device_info["device_serial_number"],
                 "deviceType": AmazonMobileApplication.MUSIC.device_type,
-            }
+            },
         )
         resp_json = response.json()
         LOGGER.debug(f"{response.status_code} {json.dumps(resp_json, indent=4)}")
@@ -1359,7 +1379,7 @@ class AmazonMusicMobileAPI:
             resp = self.post(
                 f"https://api.amazon.{self.credentials.tld}/auth/token",
                 data=body,
-                sign=False
+                sign=False,
             )
             resp.raise_for_status()
             resp_dict = resp.json()
@@ -1390,7 +1410,7 @@ class AmazonMusicMobileAPI:
         )
 
         callback_url = input("Please insert the copied url (after login):\n")
-        
+
         response_url = httpx.URL(callback_url)
         parsed_url = parse_qs(response_url.query.decode())
 
@@ -1465,7 +1485,9 @@ class AmazonMusicMobileAPI:
 
         # check for cvf
         while check_for_cvf(login_soup):
-            print("Check your email or SMS for a code from Amazon and enter it in the below prompt.")
+            print(
+                "Check your email or SMS for a code from Amazon and enter it in the below prompt."
+            )
             cvf_code = default_cvf_callback()
 
             inputs = get_inputs_from_soup(login_soup)
@@ -1508,17 +1530,16 @@ class AmazonMusicMobileAPI:
 
         authorization_code = extract_code_from_url(login_resp.url)
         LOGGER.debug(parse_qs(login_resp.url.query.decode()))
-        return authorization_code    
+        return authorization_code
 
     def get_marketplace_id(self, country_code: str) -> str:
         """Returns the marketplace id for a given country code"""
         # this is retrieved from the Amazon Music android app
-        # NOTE: this can be retrived by parsing the appConfig from the root on the netloc 
+        # NOTE: this can be retrived by parsing the appConfig from the root on the netloc
         # marketplace ID for amazon prime video: ART4WZ8MWBX2Y
-        print(country_code)
         return {
             "US": "ATVPDKIKX0DER",
             "JP": "A1VC38T7YXB528",
             "GB": "A1F83G8C2ARO7P",
-            "AU": "A39IBJ37TRP1C6"
+            "AU": "A39IBJ37TRP1C6",
         }[country_code.upper()]
