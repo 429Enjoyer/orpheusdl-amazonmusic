@@ -157,11 +157,19 @@ class AmazonWebAPI:
             "licenseChallenge": f"{challenge}",
         }
         LOGGER.debug(json.dumps(data))
-        response = self.session.post(
-            url=url,
-            data=json.dumps(data),
-            headers=headers,
-        )
+        attempt = 0
+        while attempt <= 10:
+            try:
+                response = self.session.post(
+                    url=url,
+                    data=json.dumps(data),
+                    headers=headers,
+                )
+            except httpx.HTTPError:
+                time.sleep(10)
+                continue
+            else:
+                break
 
         LOGGER.debug(str(response.content))
         if response.status_code == 200:

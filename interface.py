@@ -348,17 +348,16 @@ class ModuleInterface:
 
     # def get_track_download(self, file_url: str, codec: CodecEnum, pssh: PSSH, **kwargs):
     def get_track_download(self, audio_track: AudioTrack, **kwargs):
-        encrypted_track_location = f"{create_temp_filename()}.mp4"
-
-        download_file(
-            audio_track.url,
-            encrypted_track_location,
-            enable_progress_bar=True,
-        )
-
-        # decrypt the file (attempt to request a license)
-        session_id = self.cdm.open()
         try:
+            encrypted_track_location = f"{create_temp_filename()}.mp4"
+            download_file(
+                audio_track.url,
+                encrypted_track_location,
+                enable_progress_bar=True,
+            )
+
+            # decrypt the file (attempt to request a license)
+            session_id = self.cdm.open()
             # self.cdm.set_service_certificate(session_id, None)
             license_challenge = base64.b64encode(
                 self.cdm.get_license_challenge(
@@ -383,6 +382,7 @@ class ModuleInterface:
                 exists_ok=True,
             )
             LOGGER.debug("Ok wth decryption")
+            self.cdm.close(session_id)
 
             selected_codec_data = codec_data[audio_track.codec]
 
