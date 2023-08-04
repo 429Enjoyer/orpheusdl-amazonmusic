@@ -632,8 +632,8 @@ class ModuleInterface:
         return datetime.fromtimestamp(
             int(
                 str(
-                    album_data["originalReleaseDate"]
-                    or album_data["merchantReleaseDate"]
+                    album_data.get("originalReleaseDate")
+                    or album_data.get("merchantReleaseDate")
                 )
             )
             / 1000
