@@ -400,7 +400,7 @@ class AmazonMusicMobileAPI:
         self,
         query: str,
         asin: typing.Optional[str] = None,
-        search_types: typing.Optional[typing.Iterable] = None,
+        search_types: typing.Optional[tuple] = None,
         limit: typing.Optional[int] = 50,
     ):
         """
@@ -408,7 +408,7 @@ class AmazonMusicMobileAPI:
 
         Args:
             asin: str (Optional): To return only the document in which the ASIN is included.
-            search_types: Iterable (Optional): Search for a specific catalog type.
+            search_types: Iterable (tuple) (Optional): Search for a specific catalog type.
 
             Valid types are:
             `catalog_album, catalog_artist, catalog_playlist, catalog_station,

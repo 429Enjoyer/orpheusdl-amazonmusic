@@ -205,7 +205,7 @@ class ModuleInterface:
                 else self.mobile_session.search(
                     query=f"{album_data['title']} - {track_data['title']}",
                     asin=track_id,
-                    search_types=["catalog_track"],
+                    search_types=tuple(["catalog_track"]),
                 )
             )
 
@@ -492,6 +492,7 @@ class ModuleInterface:
         try:
             artist_data = self.mobile_session.get_metadata(artist_id)["artistList"][0]
         except Exception as e:
+            LOGGER.error(e, exc_info=1)
             return
         else:
             artist_id = str(artist_data["asin"])
@@ -502,7 +503,7 @@ class ModuleInterface:
         for album in self.mobile_session.get_documents_from_search_results(
             self.mobile_session.search(
                 query=f"{artist_name}",
-                search_types=["catalog_album"],
+                search_types=tuple(["catalog_album"]),
                 limit=500,
             )
         ):
