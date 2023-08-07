@@ -58,6 +58,7 @@ module_information = ModuleInformation(  # Only service_name and module_supporte
         "country": "",
         "country_tld": "",
         "wvd_path": "",
+        "prefer_aria2c": False,
         "prefer_mha1": False,
     },
     session_storage_variables=["credentials"],
@@ -346,7 +347,7 @@ class ModuleInterface:
         try:
             os.makedirs("temp/", exist_ok=True)
             encrypted_track_location = f"{create_temp_filename()}.mp4"
-            self.download(audio_track.url, encrypted_track_location)
+            self.download(audio_track.url, encrypted_track_location, use_aria2c=self.settings['prefer_aria2c'])
 
             # decrypt the file (attempt to request a license)
             session_id = self.cdm.open()
@@ -637,11 +638,11 @@ class ModuleInterface:
         return f"{milliseconds // 60000:02}:{(milliseconds // 1000) % 60:02}.{milliseconds % 1000:03}"
 
     @staticmethod
-    def download(url: str, location: str):
+    def download(url: str, location: str, use_aria2c: typing.Optional[bool]):
         # Attempt to use download with aria2c (faster)
         # Otherwise use the OrpheusDL default method
-        use_aria2c = shutil.which("aria2c")
-        if use_aria2c:
+        aria2c_bin = shutil.which("aria2c")
+        if aria2c_bin and use_aria2c:
             with YoutubeDL(
                 {
                     "quiet": True,
