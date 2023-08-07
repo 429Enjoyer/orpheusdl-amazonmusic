@@ -9,3 +9,4 @@ audible
 ffmpeg_python
 natsort
 bs4
+yt-dlp

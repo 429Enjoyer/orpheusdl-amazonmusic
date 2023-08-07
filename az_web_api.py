@@ -315,36 +315,11 @@ class AmazonWebAPI:
 
     @staticmethod
     def parse_for_app_config(response_text: str):
-        content = AmazonWebAPI.parse_html(response_text)
-
-        script_list: ResultSet[PageElement] = content.find_all("script")
-        for scripts in script_list:
-            if not "appConfig" in scripts.contents[0]:
-                continue
-
-            LOGGER.debug(scripts)
-            sc = scripts.contents[0]
-            sc = sc.replace("window.amznMusic = ", "")
-            sc = sc.replace("appConfig:", '"appConfig":')
-            sc = sc.replace("ssr: false,", '"ssr":""')
-            sc = sc.replace("false", '""')
-            sc = sc.replace("true", '""')
-            sc = sc.replace(os.linesep, "")
-            sc = sc.replace(";", "")
-            # test if the user has a subscription
-            # if not 'tier' in sc:
-            #     print('No tier available, log-on was not successful.')
-            #     break
-            return dict(json.loads(sc)["appConfig"])
-        return
-
-    @staticmethod
-    def parse_html(api_resp):
-        """
-        Make the request more readable
-        """
-        resp = re.sub(r"(?i)(<!doctype \w+).*>", r"\1>", api_resp)
-        return BeautifulSoup(resp, "html.parser")
+        return dict(
+            json.loads(
+                re.search(r"appConfig: ({.*}),", response_text, re.DOTALL).group(1)
+            )
+        )
 
     def get_maestro_id(self):
         """

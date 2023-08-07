@@ -1,24 +1,19 @@
 import base64
-import json
 import logging
+from pathlib import Path
 import re
-import time
-from datetime import datetime
+import shutil
 import typing
+import json
+from datetime import datetime
 from urllib.parse import urlparse
 from uuid import UUID, uuid1, uuid4
 
-import dateutil.parser
 import ffmpeg
 import natsort
-from Crypto.PublicKey import RSA
-from pywidevine import PSSH, Cdm, Device, LicenseRequest
-from pywidevine.license_protocol_pb2 import (
-    ClientIdentification,
-    DrmCertificate,
-    FileHashes,
-    SignedDrmCertificate,
-)
+from pywidevine import PSSH, Cdm, Device
+from yt_dlp import YoutubeDL
+
 
 from utils.models import *
 from utils.utils import create_temp_filename, download_file, silentremove
@@ -349,16 +344,12 @@ class ModuleInterface:
     # def get_track_download(self, file_url: str, codec: CodecEnum, pssh: PSSH, **kwargs):
     def get_track_download(self, audio_track: AudioTrack, **kwargs):
         try:
+            os.makedirs("temp/", exist_ok=True)
             encrypted_track_location = f"{create_temp_filename()}.mp4"
-            download_file(
-                audio_track.url,
-                encrypted_track_location,
-                enable_progress_bar=True,
-            )
+            self.download(audio_track.url, encrypted_track_location)
 
             # decrypt the file (attempt to request a license)
             session_id = self.cdm.open()
-            # self.cdm.set_service_certificate(session_id, None)
             license_challenge = base64.b64encode(
                 self.cdm.get_license_challenge(
                     session_id, audio_track.pssh, privacy_mode=False
@@ -373,7 +364,6 @@ class ModuleInterface:
             self.cdm.parse_license(session_id, license_response)
 
             decrypted_track_location = f"{create_temp_filename()}.mp4"  # {codec_data[audio_track.codec].container.name}
-            os.makedirs("temp/", exist_ok=True)
 
             self.cdm.decrypt(
                 session_id,
@@ -383,6 +373,7 @@ class ModuleInterface:
             )
             LOGGER.debug("Ok wth decryption")
             self.cdm.close(session_id)
+            silentremove(encrypted_track_location)
 
             selected_codec_data = codec_data[audio_track.codec]
 
@@ -404,11 +395,11 @@ class ModuleInterface:
                 loglevel="warning",
                 audio_bitrate=audio_track.bitrate,
             ).run()
+            silentremove(decrypted_track_location)
 
         except Exception as e:
             LOGGER.error(e, exc_info=1)
             self.cdm.close(session_id)
-            silentremove(encrypted_track_location)
             return
 
         return TrackDownloadInfo(
@@ -644,10 +635,41 @@ class ModuleInterface:
         # Convert milliseconds to the proper LRC time format [mm:ss.xx]
         return f"{milliseconds // 60000:02}:{(milliseconds // 1000) % 60:02}.{milliseconds % 1000:03}"
 
+    @staticmethod
+    def download(url: str, location: str):
+        # Attempt to use download with aria2c (faster)
+        # Otherwise use the OrpheusDL default method
+        use_aria2c = shutil.which("aria2c")
+        if use_aria2c:
+            with YoutubeDL(
+                {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "outtmpl": location,  # must be a path including the filename
+                    "allow_unplayable_formats": True,
+                    "fixup": "never",
+                    "overwrites": True,
+                    "external_downloader": "aria2c",
+                    # "logger": LOGGER
+                }
+            ) as ydl:
+                ydl.download(url)
+        else:
+            download_file(
+                url,
+                location,
+                enable_progress_bar=True,
+            )
+
     def _parse_track_mpd(self, mpd: dict, track_asin: str):
+        """
+        Iterate over the manifest to grab the tracks and append them to avaliable_tracks as a AudioTrack object
+
+
+        (which is a xml file that follows the urn:mpeg:dash:profile:isoff-on-demand:2011 profile)
+        """
         manifest = dict(mpd["MPD"]["Period"])
         avaliable_tracks: list[AudioTrack] = []
-        # iterate over the manifest (which is a xml file that follows the urn:mpeg:dash:profile:isoff-on-demand:2011 profile to grab the tracks and append them to avaliable_tracks as a AudioTrack object
         # for period in manifest.findall("Period"):
         # for period in manifest.get("Period"):
         for adaptation_set in manifest.get("AdaptationSet"):

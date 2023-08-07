@@ -3,19 +3,26 @@
 
 Written by: [reaitten](https://github.com/reaitten)
 
-## Install
+## Installation
 
-Install `shaka-packager` and `ffmpeg` onto your host computer.\
-Download or clone the source code into `modules`.
+1. Install [`shaka-packager`](https://github.com/shaka-project/shaka-packager/releases/latest), [`ffmpeg`](https://ffmpeg.org/), and [`aria2c`](https://github.com/aria2/aria2/releases/latest) (optional) onto your host computer.
 
-It is recomended to use a [*virtual environment*](https://docs.python.org/3/library/venv.html). (not required)\
-To install requirements:\
+2. Download or clone the source code into `modules`.
+Example: `git clone https://github.com/reaitten/orpheusdl-amazonmusic modules/amazon` 
+
+[!IMPORTANT]
+You must be inside your cloned installation of orpheusdl first.
+
+
+It is recomended to use a [*virtual environment*](https://docs.python.org/3/library/venv.html). (not required)
+
+3. To install requirements:\
 ```pip install -r requirements.txt```
 
-Update ```config/settings.json``` with Amazon Music settings:\
+4. Update ```config/settings.json``` with Amazon Music settings:\
 ```python orpheus.py```
 
-Fill in all the fields under `orpheusdl-amazondl` as they are all required.
+5. Fill in all the fields under `orpheusdl-amazonmusic` as they are all required.
 
 To create a `.wvd` file:\
 ```pywidevine create-device --type ANDROID --level 3 --key "private_key.pem" --client_id "client_id.bin"```\

@@ -1,5 +1,6 @@
 import base64
 import dataclasses
+import functools
 import json
 import logging
 import logging.handlers
@@ -321,6 +322,7 @@ class AmazonMusicMobileAPI:
             headers={"User-Agent": self.USER_AGENT},
         ).text
 
+    @functools.lru_cache()
     def get_metadata(
         self, asins: str | typing.Sequence[str]
     ) -> dict[str, list[dict[str, Any]]]:
@@ -393,6 +395,7 @@ class AmazonMusicMobileAPI:
         LOGGER.debug(json.dumps(resp_json, indent=2))
         return resp_json
 
+    @functools.lru_cache()
     def search(
         self,
         query: str,
@@ -404,7 +407,7 @@ class AmazonMusicMobileAPI:
         Search for a item using a query.
 
         Args:
-            asin: str (Optional): To return only the item in which the ASIN is included.
+            asin: str (Optional): To return only the document in which the ASIN is included.
             search_types: Iterable (Optional): Search for a specific catalog type.
 
             Valid types are:
