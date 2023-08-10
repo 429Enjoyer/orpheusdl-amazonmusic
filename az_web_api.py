@@ -43,7 +43,7 @@ class AmazonWebAPI:
         if self.cookie_path.exists():
             cookies = self.get_cookie_from_file(self.cookie_path)
         else:
-            LOGGER.warning("Could not find cookies.txt, skipping..")
+            LOGGER.info("Could not find cookies.txt, skipping..")
 
         self.music_url = "https://music.amazon."
 

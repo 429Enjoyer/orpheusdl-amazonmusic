@@ -161,7 +161,7 @@ class ModuleInterface:
         # use the same logic as orpheusdl cuz lazy
         url_constants = {
             "albums": DownloadTypeEnum.album,
-            # "playlists": DownloadTypeEnum.playlist, #TODO
+            # "playlists": DownloadTypeEnum.playlist,  # TODO
             "artists": DownloadTypeEnum.artist,
         }
 
@@ -347,7 +347,11 @@ class ModuleInterface:
         try:
             os.makedirs("temp/", exist_ok=True)
             encrypted_track_location = f"{create_temp_filename()}.mp4"
-            self.download(audio_track.url, encrypted_track_location, use_aria2c=self.settings['prefer_aria2c'])
+            self.download(
+                audio_track.url,
+                encrypted_track_location,
+                use_aria2c=self.settings["prefer_aria2c"],
+            )
 
             # decrypt the file (attempt to request a license)
             session_id = self.cdm.open()
@@ -591,24 +595,60 @@ class ModuleInterface:
         track_info: TrackInfo = None,
         limit: int = 10,
     ):  # Mandatory
+        if (
+            query_type is DownloadTypeEnum.artist
+            or query_type is DownloadTypeEnum.playlist
+        ):
+            # super lazy
+            raise TypeError(f"{query_type} is not supported yet!")
+
         results = {}
-        if track_info and track_info.tags.isrc:
-            results = self.mobile_session.search(
-                query_type.name, track_info.tags.isrc, limit
-            )
+        search_type = {item.name: f"catalog_{item.name}" for item in DownloadTypeEnum}[
+            query_type.name
+        ]
+        # if track_info and track_info.tags.isrc:
+        #     results = list(self.mobile_session.get_documents_from_search_results(
+        #         self.mobile_session.search(
+        #             search_type, track_info.tags.isrc, limit
+        #         )
+        #     ))
         if not results:
-            results = self.mobile_session.search(query_type.name, query, limit)
+            results = list(
+                self.mobile_session.get_documents_from_search_results(
+                    self.mobile_session.search(
+                        query=query, search_types=tuple([search_type]), limit=limit
+                    )
+                )
+            )
 
         return [
             SearchResult(
-                result_id="",
-                name="",  # optional only if a lyrics/covers only module
-                artists=[],  # optional only if a lyrics/covers only module or an artist search
-                year="",  # optional
-                explicit=False,  # optional
-                additional=[],  # optional, used to convey more info when using orpheus.py search (not luckysearch, for obvious reasons)
+                result_id=i["asin"],
+                name=i["title"],  # optional only if a lyrics/covers only module
+                artists=[
+                    i["artistName"]
+                ],  # optional only if a lyrics/covers only module or an artist search
+                year=datetime.fromtimestamp(
+                    round(float(str(i.get("originalReleaseDate"))))
+                ).strftime(
+                    "%Y"
+                ),  # optional
+                explicit=i["parentalControls"]["hasExplicitLanguage"],  # optional
+                additional=natsort.natsorted(
+                    map(
+                        lambda item: {
+                            "hdAvailable": "HD",
+                            "uhdAvailable": "UHD",
+                            "atmosAvailable": "Dolby Atmos",
+                            "ra360Available": "360 Reality Audio",
+                            "immersive": "Immersive Audio",
+                        }[item],
+                        i.get("contentEncoding", []),
+                    ),
+                    key=len,
+                ),  # optional, used to convey more info when using orpheus.py search (not luckysearch, for obvious reasons)
                 extra_kwargs={
-                    "data": {f"{i['id']}_search": i}
+                    "data": {f"{i['asin']}_search": i}
                 }  # optional, whatever you want. NOTE: BE CAREFUL! this can be given to:
                 # get_track_info, get_album_info, get_artist_info with normal search results, and
                 # get_track_credits, get_track_cover, get_track_lyrics in the case of other modules using this module just for those.
