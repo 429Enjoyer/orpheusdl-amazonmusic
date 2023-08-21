@@ -3,15 +3,19 @@ import logging
 from pathlib import Path
 import re
 import shutil
+import socket
+import subprocess
 import typing
 import json
 from datetime import datetime
 from urllib.parse import urlparse
 from uuid import UUID, uuid1, uuid4
+import aria2p
 
 import ffmpeg
 import natsort
 from pywidevine import PSSH, Cdm, Device
+from tqdm import tqdm
 from yt_dlp import YoutubeDL
 
 
@@ -112,6 +116,9 @@ class ModuleInterface:
         if not self.mobile_session.credentials:
             self.login_onto_mobile(self.settings["email"], self.settings["password"])
 
+        if self.mobile_session.credentials.access_token_expired:
+            self.mobile_session.refresh_access_token()
+
         self.web_session = AmazonWebAPI(
             self.mobile_session.credentials, dict(self.mobile_session.session.cookies)
         )
@@ -184,9 +191,6 @@ class ModuleInterface:
         data={},
     ) -> TrackInfo:  # Mandatory
         try:
-            if self.mobile_session.credentials.access_token_expired:
-                self.mobile_session.refresh_access_token()
-
             # quality_to_use = self.quality_parse[quality_tier]
 
             track_data = (
@@ -344,6 +348,7 @@ class ModuleInterface:
 
     # def get_track_download(self, file_url: str, codec: CodecEnum, pssh: PSSH, **kwargs):
     def get_track_download(self, audio_track: AudioTrack, **kwargs):
+        session_id = None
         try:
             os.makedirs("temp/", exist_ok=True)
             encrypted_track_location = f"{create_temp_filename()}.mp4"
@@ -404,7 +409,8 @@ class ModuleInterface:
 
         except Exception as e:
             LOGGER.error(e, exc_info=1)
-            self.cdm.close(session_id)
+            if session_id:
+                self.cdm.close(session_id)
             return
 
         return TrackDownloadInfo(
@@ -672,30 +678,26 @@ class ModuleInterface:
             / 1000
         )
 
-    @staticmethod
-    def milliseconds_to_lrc_time(milliseconds: int):
-        # Convert milliseconds to the proper LRC time format [mm:ss.xx]
-        return f"{milliseconds // 60000:02}:{(milliseconds // 1000) % 60:02}.{milliseconds % 1000:03}"
-
-    @staticmethod
-    def download(url: str, location: str, use_aria2c: typing.Optional[bool]):
+    def download(self, url: str, location: str, use_aria2c: typing.Optional[bool]):
         # Attempt to use download with aria2c (faster)
         # Otherwise use the OrpheusDL default method
         aria2c_bin = shutil.which("aria2c")
         if aria2c_bin and use_aria2c:
-            with YoutubeDL(
-                {
-                    "quiet": True,
-                    "no_warnings": True,
-                    "outtmpl": location,  # must be a path including the filename
-                    "allow_unplayable_formats": True,
-                    "fixup": "never",
-                    "overwrites": True,
-                    "external_downloader": "aria2c",
-                    # "logger": LOGGER
-                }
-            ) as ydl:
-                ydl.download(url)
+            # with YoutubeDL(
+            #     {
+            #         "quiet": True,
+            #         "no_warnings": True,
+            #         "outtmpl": location,  # must be a path including the filename
+            #         "allow_unplayable_formats": True,
+            #         "fixup": "never",
+            #         "overwrites": True,
+            #         "external_downloader": "aria2c",
+            #         # "logger": LOGGER
+            #     }
+            # ) as ydl:
+            #     ydl.download(url)
+
+            ModuleInterface.download_with_aria2c(url, location)
         else:
             download_file(
                 url,
@@ -703,6 +705,89 @@ class ModuleInterface:
                 enable_progress_bar=True,
             )
 
+    @staticmethod
+    def milliseconds_to_lrc_time(milliseconds: int):
+        # Convert milliseconds to the proper LRC time format [mm:ss.xx]
+        return f"{milliseconds // 60000:02}:{(milliseconds // 1000) % 60:02}.{milliseconds % 1000:03}"
+
+    @classmethod
+    def download_with_aria2c(cls, url: str, output_path: str):
+        # I am not proud with this code, but it works so its fine for now
+        # Refactor if
+        aria2c_bin = shutil.which("aria2c")
+        if not aria2c_bin:
+            return False
+        secret = os.urandom(16).hex()
+        open_port = cls.find_available_port()
+        
+        rpc_proc = None
+        
+        try:
+            rpc_proc = cls._open_aria2c_rpc(aria2c_bin, secret, open_port)
+            session = aria2p.API(
+                aria2p.Client(
+                    host="http://localhost",
+                    port=open_port,
+                    secret=secret
+                )
+            )
+            download = session.add_uris([url], {"out": output_path})
+            
+            # Wait for the download to start
+            while not download.is_active or not download.total_length:
+                download.update()
+
+            # Funny progress bar to maintain consistency
+            with tqdm(
+                total=download.total_length, unit="B",
+                unit_scale=True,
+                unit_divisor=1024
+            ) as pbar:
+                while download.is_active:
+                    download.update()
+                    pbar.update(download.completed_length - pbar.n)
+                    pbar.refresh()
+        finally:
+            if rpc_proc:
+                rpc_proc.kill()
+
+    @classmethod
+    def _open_aria2c_rpc(cls, aria2c_bin: str, secret: str, open_port: str | int):
+        rpc_proc = subprocess.Popen(
+            [aria2c_bin, "--enable-rpc", "--rpc-listen-all=true", "--rpc-allow-origin-all", f"--rpc-listen-port={open_port}", "--rpc-secret", secret],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        is_listening = False
+        while not is_listening:
+            line = rpc_proc.stdout.readline()
+            if not line or not line.split():
+                continue
+            # Find the logged message
+            if match := re.search(r"\d{2}/\d{2} \d{2}:\d{2}:\d{2}\s+\[(.*?)\]\s+(.*)", line):
+                if "RPC: listening" not in match.group(2):
+                    LOGGER.error("aria2c RPC: %s", match.group(2))
+                    # Be sure the RPC dies before raising
+                    # To prevent stray aria2c RPCs running
+                    rpc_proc.kill() 
+                    raise ValueError(match.group(2))
+            if f"RPC: listening on TCP port {open_port}" in line:
+                is_listening = True
+
+        # nobreak
+        else:
+            return rpc_proc
+            
+    @staticmethod    
+    def find_available_port():
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        sock.bind(("localhost", 0)) 
+        port = int(sock.getsockname()[1]) # Get the chosen port
+
+        sock.close()
+
+        return port
+    
     def _parse_track_mpd(self, mpd: dict, track_asin: str):
         """
         Iterate over the manifest to grab the tracks and append them to avaliable_tracks as a AudioTrack object
