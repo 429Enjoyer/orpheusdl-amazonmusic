@@ -7,6 +7,7 @@ import socket
 import subprocess
 import typing
 import json
+import dataclasses
 from datetime import datetime
 from urllib.parse import urlparse
 from uuid import UUID, uuid1, uuid4
@@ -27,7 +28,7 @@ from .azapi import AmazonMusicMobileAPI, AmazonMusicMobileAPICredentials
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclasses.dataclass
 class AudioTrack:
     asin: str
     codec: CodecEnum
@@ -38,6 +39,9 @@ class AudioTrack:
     quality: str
     quality_ranking: int
     bit_depth: Optional[int] = None
+    
+    def to_dict(self):
+        return dataclasses.asdict(self)
 
 
 # This is a Amazon Music module for OrpheusDL, doesn't not require an active subscription
@@ -77,6 +81,7 @@ class ModuleInterface:
     def __init__(self, module_controller: ModuleController):
         self.settings = module_controller.module_settings
         self.module_controller = module_controller
+        # Items highest are iterated first
         self.quality_parse = {
             QualityEnum.MINIMUM: [
                 "LD",
@@ -91,10 +96,13 @@ class ModuleInterface:
                 "SD_HIGH",
             ],
             QualityEnum.LOSSLESS: [
-                "HD",
                 "UHD",
+                "HD",
             ],
-            QualityEnum.HIFI: ["SPATIAL_ATMOS", "SPATIAL_RA360"],
+            QualityEnum.HIFI: [
+                "SPATIAL_RA360",
+                "SPATIAL_ATMOS"
+            ],
         }
         # if not module_controller.orpheus_options.disable_subscription_check and (
         #     self.quality_parse[module_controller.orpheus_options.quality_tier]
@@ -233,32 +241,40 @@ class ModuleInterface:
                     )
                 )
 
-            LOGGER.debug(list(map(lambda x: x.quality, avaliable_tracks)))
+            # Sorting by bitrate helps retrieve the highest resolution avaliable
             LOGGER.debug(avaliable_tracks)
 
-            avaliable_qualities_enum = list(
+            # A range between the lowest quality and the highest quality of the user's maximum quality tier
+            avaliable_usable_qualities = list(
                 k for k in self.quality_parse.keys() if k.value <= quality_tier.value
             )
-            LOGGER.debug(avaliable_qualities_enum)
+            LOGGER.debug(avaliable_usable_qualities)
+
             # Select the highest quality avaliable, start iterating at max first
             # NOTE there *could* be a different way of doing this, i'm just stupid af
             track_to_use = None
-            for qualities, oquality in zip(
-                reversed(self.quality_parse.values()), reversed(self.quality_parse)
-            ):
-                if oquality not in avaliable_qualities_enum:
+            for oquality, qualities in reversed(self.quality_parse.items()):
+                if oquality not in avaliable_usable_qualities:
                     continue
                 for quality in qualities:
-                    for item in natsort.natsorted(
+                    # Reversed because best quality is lowest integer (AudioTrack.quality_ranking) 
+                    avaliable_tracks_of_quality = natsort.natsorted(
                         filter(
                             lambda c: c.quality.startswith(quality), avaliable_tracks
                         ),
                         key=lambda x: x.quality_ranking,
-                    ):
-                        if not item.quality.startswith(quality):
-                            continue
-                        track_to_use = item
-                        break
+                        reverse=True
+                    )
+                    if not avaliable_tracks_of_quality:
+                        continue
+                    if len(avaliable_tracks_of_quality) > 1:
+                        LOGGER.warning(
+                            f"There are more than one tracks avaliable for {quality}. "
+                            f'Avaliable qualities: {", ".join("{} - {}".format(item.quality, item.quality_ranking) for item in avaliable_tracks_of_quality)}'
+                        )
+                    track_to_use = avaliable_tracks_of_quality[0]
+                    break
+
                 if track_to_use is not None:
                     break
 
@@ -277,11 +293,11 @@ class ModuleInterface:
                 "Composer": composers,  # force set the composer tag, because orpheus doesn't handle it
                 "WWW": url,
             }
-            if album_data.get("productDetails", {}).get("merchantName"):
+            if merchant_name := album_data.get("productDetails", {}).get("merchantName"):
                 extra_tags.update(
                     {
                         "Merchant": " ".join(
-                            str(album_data["productDetails"]["merchantName"]).split()
+                            str(merchant_name).split() # Remove whitespaces, if any (e.g Amazon Music USA) 
                         )
                     }
                 )
@@ -891,6 +907,7 @@ class ModuleInterface:
 
                 codec = CodecEnum[codec]
                 # LOGGER.debug(codec)
+                # print(representation)
 
                 avaliable_tracks.append(
                     AudioTrack(
