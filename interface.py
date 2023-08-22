@@ -22,7 +22,6 @@ from yt_dlp import YoutubeDL
 from utils.models import *
 from utils.utils import create_temp_filename, download_file, silentremove
 
-from .az_web_api import AmazonWebAPI
 from .azapi import AmazonMusicMobileAPI, AmazonMusicMobileAPICredentials
 
 LOGGER = logging.getLogger(__name__)
@@ -108,24 +107,17 @@ class ModuleInterface:
         self.cdm = Cdm.from_device(Device.load(self.settings["wvd_path"]))
 
         creds = module_controller.temporary_settings_controller.read("credentials")
-        credentials = AmazonMusicMobileAPICredentials(**creds) if creds else None
+        credentials = AmazonMusicMobileAPICredentials.from_dict(creds) if creds else None
 
-        self.mobile_session = AmazonMusicMobileAPI(
-            credentials=credentials, country_code=self.settings["country"]
-        )
-        if not self.mobile_session.credentials:
+        if credentials:
+            self.mobile_session = AmazonMusicMobileAPI(
+                credentials=credentials
+            )
+        else:
             self.login_onto_mobile(self.settings["email"], self.settings["password"])
 
         if self.mobile_session.credentials.access_token_expired:
             self.mobile_session.refresh_access_token()
-
-        self.web_session = AmazonWebAPI(
-            self.mobile_session.credentials, dict(self.mobile_session.session.cookies)
-        )
-        self.web_session.get_config(
-            response_text=self.mobile_session.get_root(),
-            country_tld=self.settings["country_tld"],
-        )
 
         module_controller.temporary_settings_controller.set(
             "credentials", self.mobile_session.credentials.to_dict()
@@ -136,15 +128,13 @@ class ModuleInterface:
     def login_onto_mobile(
         self, email: str, password: str
     ):  # Called automatically by Orpheus when standard_login is flagged, otherwise optional
-        credentials = self.mobile_session.login_via_mobile(
+        self.mobile_session = AmazonMusicMobileAPI.login_via_mobile(
             email, password, self.settings["country_tld"], self.settings["country"]
         )
-        if not credentials:
+        if not self.mobile_session:
             raise Exception("Login failed")
 
-        self.module_controller.temporary_settings_controller.set(
-            "credentials", credentials.to_dict()
-        )
+        return self.mobile_session
 
     def custom_url_parse(self, link: str) -> MediaIdentification:
         url = urlparse(link)
@@ -213,7 +203,12 @@ class ModuleInterface:
                     search_types=tuple(["catalog_track"]),
                 )
             )
-
+            search_data_track = self.mobile_session.search(
+                query=f"{album_data['title']} - {track_data['title']}",
+                asin=track_id,
+                search_types=tuple(["catalog_track"]),
+            )
+            print(json.dumps(search_data_track, indent=3))
             # TODO, unused for now
             # artists = self.mobile_session.get_metadata(
             #     [track_data["artist"]["asin"], *track_data["artist"]["contributorAsins"]], self.settings["country"]
@@ -275,10 +270,11 @@ class ModuleInterface:
                     track_data.get("songWriters", [album_data["primaryArtistName"]])
                 )
             )
-            comment = f"https://music.amazon.{self.mobile_session.credentials.tld}/albums/{album_id}"
+            url = f"https://music.amazon.{self.mobile_session.credentials.tld}/albums/{album_id}?trackAsin={track_id}"
 
             extra_tags = {
                 "Composer": composers,  # force set the composer tag, because orpheus doesn't handle it
+                "WWW": url,
             }
             if album_data.get("productDetails", {}).get("merchantName"):
                 extra_tags.update(
@@ -306,7 +302,7 @@ class ModuleInterface:
                 release_date=release_datetime.strftime(
                     "%Y-%m-%d"
                 ),  # Format: YYYY-MM-DD
-                comment=comment,
+                # comment=comment,
                 extra_tags=extra_tags,
             )
 
@@ -344,7 +340,7 @@ class ModuleInterface:
                 error="",  # only use if there is an error
             )
         except Exception as e:
-            LOGGER.debug(e, exc_info=1)
+            LOGGER.error(e, exc_info=1)
 
     # def get_track_download(self, file_url: str, codec: CodecEnum, pssh: PSSH, **kwargs):
     def get_track_download(self, audio_track: AudioTrack, **kwargs):
@@ -366,7 +362,7 @@ class ModuleInterface:
                 )
             ).decode("utf-8")
 
-            license_response = self.web_session.get_license_response(license_challenge)
+            license_response = self.mobile_session.get_license_response(audio_track.asin, license_challenge) # self.web_session.get_license_response(license_challenge)
             if not license_response:
                 license_response = input(
                     "License retrieval failed, enter response here: "
