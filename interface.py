@@ -203,12 +203,13 @@ class ModuleInterface:
                     search_types=tuple(["catalog_track"]),
                 )
             )
-            search_data_track = self.mobile_session.search(
-                query=f"{album_data['title']} - {track_data['title']}",
-                asin=track_id,
-                search_types=tuple(["catalog_track"]),
-            )
-            print(json.dumps(search_data_track, indent=3))
+            # search_data_track = self.mobile_session.search(
+            #     query=f"{album_data['title']} - {track_data['title']}",
+            #     asin=track_id,
+            #     search_types=tuple(["catalog_track"]),
+            # )
+            # print(json.dumps(search_data_track, indent=3))
+
             # TODO, unused for now
             # artists = self.mobile_session.get_metadata(
             #     [track_data["artist"]["asin"], *track_data["artist"]["contributorAsins"]], self.settings["country"]
