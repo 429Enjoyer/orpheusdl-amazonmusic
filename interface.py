@@ -39,12 +39,12 @@ class AudioTrack:
     quality: str
     quality_ranking: int
     bit_depth: Optional[int] = None
-    
+
     def to_dict(self):
         return dataclasses.asdict(self)
 
 
-# This is a Amazon Music module for OrpheusDL, doesn't not require an active subscription
+# This is a Amazon Music module for OrpheusDL, require an active unlimited subscription
 
 module_information = ModuleInformation(  # Only service_name and module_supported_modes are mandatory
     service_name="Amazon Music",
@@ -99,10 +99,7 @@ class ModuleInterface:
                 "UHD",
                 "HD",
             ],
-            QualityEnum.HIFI: [
-                "SPATIAL_RA360",
-                "SPATIAL_ATMOS"
-            ],
+            QualityEnum.HIFI: ["SPATIAL_RA360", "SPATIAL_ATMOS"],
         }
         # if not module_controller.orpheus_options.disable_subscription_check and (
         #     self.quality_parse[module_controller.orpheus_options.quality_tier]
@@ -115,12 +112,12 @@ class ModuleInterface:
         self.cdm = Cdm.from_device(Device.load(self.settings["wvd_path"]))
 
         creds = module_controller.temporary_settings_controller.read("credentials")
-        credentials = AmazonMusicMobileAPICredentials.from_dict(creds) if creds else None
+        credentials = (
+            AmazonMusicMobileAPICredentials.from_dict(creds) if creds else None
+        )
 
         if credentials:
-            self.mobile_session = AmazonMusicMobileAPI(
-                credentials=credentials
-            )
+            self.mobile_session = AmazonMusicMobileAPI(credentials=credentials)
         else:
             self.login_onto_mobile(self.settings["email"], self.settings["password"])
 
@@ -257,13 +254,13 @@ class ModuleInterface:
                 if oquality not in avaliable_usable_qualities:
                     continue
                 for quality in qualities:
-                    # Reversed because best quality is lowest integer (AudioTrack.quality_ranking) 
+                    # Reversed because best quality is lowest integer (AudioTrack.quality_ranking)
                     avaliable_tracks_of_quality = natsort.natsorted(
                         filter(
                             lambda c: c.quality.startswith(quality), avaliable_tracks
                         ),
                         key=lambda x: x.quality_ranking,
-                        reverse=True
+                        reverse=True,
                     )
                     if not avaliable_tracks_of_quality:
                         continue
@@ -293,11 +290,15 @@ class ModuleInterface:
                 "Composer": composers,  # force set the composer tag, because orpheus doesn't handle it
                 "WWW": url,
             }
-            if merchant_name := album_data.get("productDetails", {}).get("merchantName"):
+            if merchant_name := album_data.get("productDetails", {}).get(
+                "merchantName"
+            ):
                 extra_tags.update(
                     {
                         "Merchant": " ".join(
-                            str(merchant_name).split() # Remove whitespaces, if any (e.g Amazon Music USA) 
+                            str(
+                                merchant_name
+                            ).split()  # Remove whitespaces, if any (e.g Amazon Music USA)
                         )
                     }
                 )
@@ -379,7 +380,9 @@ class ModuleInterface:
                 )
             ).decode("utf-8")
 
-            license_response = self.mobile_session.get_license_response(audio_track.asin, license_challenge) # self.web_session.get_license_response(license_challenge)
+            license_response = self.mobile_session.get_license_response(
+                audio_track.asin, license_challenge
+            )
             if not license_response:
                 license_response = input(
                     "License retrieval failed, enter response here: "
@@ -726,35 +729,31 @@ class ModuleInterface:
     @classmethod
     def download_with_aria2c(cls, url: str, output_path: str):
         # I am not proud with this code, but it works so its fine for now
-        # Refactor if
         aria2c_bin = shutil.which("aria2c")
         if not aria2c_bin:
             return False
         secret = os.urandom(16).hex()
         open_port = cls.find_available_port()
-        
+
         rpc_proc = None
-        
+
         try:
             rpc_proc = cls._open_aria2c_rpc(aria2c_bin, secret, open_port)
             session = aria2p.API(
-                aria2p.Client(
-                    host="http://localhost",
-                    port=open_port,
-                    secret=secret
-                )
+                aria2p.Client(host="http://localhost", port=open_port, secret=secret)
             )
             download = session.add_uris([url], {"out": output_path})
-            
+
             # Wait for the download to start
             while not download.is_active or not download.total_length:
                 download.update()
 
             # Funny progress bar to maintain consistency
             with tqdm(
-                total=download.total_length, unit="B",
+                total=download.total_length,
+                unit="B",
                 unit_scale=True,
-                unit_divisor=1024
+                unit_divisor=1024,
             ) as pbar:
                 while download.is_active:
                     download.update()
@@ -767,8 +766,18 @@ class ModuleInterface:
     @classmethod
     def _open_aria2c_rpc(cls, aria2c_bin: str, secret: str, open_port: str | int):
         rpc_proc = subprocess.Popen(
-            [aria2c_bin, "--enable-rpc", "--rpc-listen-all=true", "--rpc-allow-origin-all", f"--rpc-listen-port={open_port}", "--rpc-secret", secret],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            [
+                aria2c_bin,
+                "--enable-rpc",
+                "--rpc-listen-all=true",
+                "--rpc-allow-origin-all",
+                f"--rpc-listen-port={open_port}",
+                "--rpc-secret",
+                secret,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         is_listening = False
         while not is_listening:
@@ -776,12 +785,14 @@ class ModuleInterface:
             if not line or not line.split():
                 continue
             # Find the logged message
-            if match := re.search(r"\d{2}/\d{2} \d{2}:\d{2}:\d{2}\s+\[(.*?)\]\s+(.*)", line):
+            if match := re.search(
+                r"\d{2}/\d{2} \d{2}:\d{2}:\d{2}\s+\[(.*?)\]\s+(.*)", line
+            ):
                 if "RPC: listening" not in match.group(2):
                     LOGGER.error("aria2c RPC: %s", match.group(2))
                     # Be sure the RPC dies before raising
                     # To prevent stray aria2c RPCs running
-                    rpc_proc.kill() 
+                    rpc_proc.kill()
                     raise ValueError(match.group(2))
             if f"RPC: listening on TCP port {open_port}" in line:
                 is_listening = True
@@ -789,18 +800,18 @@ class ModuleInterface:
         # nobreak
         else:
             return rpc_proc
-            
-    @staticmethod    
+
+    @staticmethod
     def find_available_port():
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-        sock.bind(("localhost", 0)) 
-        port = int(sock.getsockname()[1]) # Get the chosen port
+        sock.bind(("localhost", 0))
+        port = int(sock.getsockname()[1])  # Get the chosen port
 
         sock.close()
 
         return port
-    
+
     def _parse_track_mpd(self, mpd: dict, track_asin: str):
         """
         Iterate over the manifest to grab the tracks and append them to avaliable_tracks as a AudioTrack object
@@ -818,29 +829,12 @@ class ModuleInterface:
             content_type = adaptation_set.get("@contentType")
             if content_type != "audio":
                 raise ValueError("Only supports audio MPDs!")
-            # # use the correct quality type requested, NEEDS TO BE FIXED FOR (SD_LOW, SD_MEDIUM, SD_HIGH AND SPATIAL_AUDIO)
-            # for supplemental_property in adaptation_set.findall(
-            #     "SupplementalProperty"
-            # ):
-            #     if supplemental_property.get(
-            #         "schemeIdUri"
-            #     ) == "amz-music:trackType" and supplemental_property.get(
-            #         "value"
-            #     ).startswith(
-            #         self.quality_parse[quality_tier]
-            #     ):
-            #         track_type = supplemental_property.get("value")
-            #         break
-            # else:
-            #     continue
 
             key_id = None
             pssh = None
             # print(dict(adaptation_set.items()))
 
-            # print(adaptation_set.get("ContentProtection"))
             for content_property in adaptation_set.get("ContentProtection"):
-                # print(content_property.attrib)
                 # print(content_property)
                 if (
                     content_property.get("@schemeIdUri")
@@ -859,7 +853,7 @@ class ModuleInterface:
                     # print(f"{pssh=}")
                     break
 
-            if not key_id or not pssh:
+            if not (key_id and pssh):
                 print("failed")
                 raise ValueError("No key id or PSSH found!")
 

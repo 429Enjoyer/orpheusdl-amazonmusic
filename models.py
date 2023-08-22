@@ -45,7 +45,7 @@ class AmazonMusicMobileAPICredentials:
 
     def to_dict(self):
         return dataclasses.asdict(self)
-    
+
     @classmethod
     def from_dict(cls, creds_dict: dict):
         web_client_config = None
@@ -53,12 +53,10 @@ class AmazonMusicMobileAPICredentials:
             web_client_config = AmazonWebConfig(**web_client_config_dict)
             creds_dict.pop("web_client_config")
 
-        creds_dict.update({
-            "web_client_config": web_client_config
-        })
-        
+        creds_dict.update({"web_client_config": web_client_config})
+
         inst = cls(**creds_dict)
-        
+
         return inst
 
     @property
