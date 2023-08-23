@@ -914,7 +914,7 @@ class AmazonMusicMobileAPI:
         return session
 
     @staticmethod
-    def _get_web_client_configuration(tld: str, app_conf: typing.Optional[dict]):
+    def _get_web_client_configuration(tld: str, app_conf: typing.Optional[dict] = None):
         if not app_conf:
             app_conf = AmazonMusicMobileAPI.parse_for_app_config(
                 AmazonMusicMobileAPI._wait_for_response(
