@@ -8,11 +8,12 @@ import subprocess
 import typing
 import json
 import dataclasses
+import itertools
 from datetime import datetime
 from urllib.parse import urlparse
 from uuid import UUID, uuid1, uuid4
-import aria2p
 
+import aria2p
 import ffmpeg
 import natsort
 from pywidevine import PSSH, Cdm, Device
@@ -28,14 +29,14 @@ from .azapi import AmazonMusicMobileAPI, AmazonMusicMobileAPICredentials
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(slots=True)
 class AudioTrack:
     asin: str
     codec: CodecEnum
     bitrate: int
     sample_rate: int
     url: str
-    pssh: str
+    pssh: PSSH
     quality: str
     quality_ranking: int
     bit_depth: Optional[int] = None
@@ -66,7 +67,9 @@ module_information = ModuleInformation(  # Only service_name and module_supporte
         "country_tld": "",
         "wvd_path": "",
         "prefer_aria2c": False,
-        "prefer_mha1": False,
+        "prefer_spatial_mha1": False,
+        "prefer_spatial_ac4": False,
+        "max_track_quality_to_use": "",
     },
     session_storage_variables=["credentials"],
     netlocation_constant="amazon",
@@ -108,6 +111,7 @@ class ModuleInterface:
         #     print(
         #         "Example: quality set in the settings is not accessible by the current subscription"
         #     )
+        self.print = module_controller.printer_controller.oprint
 
         self.cdm = Cdm.from_device(Device.load(self.settings["wvd_path"]))
 
@@ -133,11 +137,13 @@ class ModuleInterface:
     def login_onto_mobile(
         self, email: str, password: str
     ):  # Called automatically by Orpheus when standard_login is flagged, otherwise optional
-        self.mobile_session = AmazonMusicMobileAPI.login_via_mobile(
+        mobile_session = AmazonMusicMobileAPI.login_via_mobile(
             email, password, self.settings["country_tld"], self.settings["country"]
         )
-        if not self.mobile_session:
+        if not mobile_session:
             raise Exception("Login failed")
+
+        self.mobile_session = mobile_session
 
         return self.mobile_session
 
@@ -183,7 +189,7 @@ class ModuleInterface:
         track_id: str,
         quality_tier: QualityEnum,
         codec_options: CodecOptions,
-        data={},
+        data: dict = {},
     ) -> TrackInfo:  # Mandatory
         try:
             # quality_to_use = self.quality_parse[quality_tier]
@@ -221,63 +227,94 @@ class ModuleInterface:
             # )["artistList"]
 
             release_datetime = self._get_date_from_metadata(album_data)
-            mpd = dict(self.mobile_session.get_track_manifest(track_id))
+            mpd = self.mobile_session.get_track_manifest(track_id)
             # LOGGER.debug(json.dumps(mpd, indent=3))
             avaliable_tracks = self._parse_track_mpd(mpd, track_id)
-
-            # filter out spatial audio, if specified
-            if not codec_options.spatial_codecs:
-                avaliable_tracks = list(
-                    filter(lambda c: not codec_data[c.codec].spatial, avaliable_tracks)
-                )
-            if not self.settings["prefer_mha1"]:
-                avaliable_tracks = list(
-                    filter(
-                        lambda c: c.codec.value != CodecEnum.MHA1.value,
-                        avaliable_tracks,
-                    )
-                )
 
             # Sorting by bitrate helps retrieve the highest resolution avaliable
             LOGGER.debug(avaliable_tracks)
 
-            # A range between the lowest quality and the highest quality of the user's maximum quality tier
-            avaliable_usable_qualities = list(
-                k for k in self.quality_parse.keys() if k.value <= quality_tier.value
+            preferred_codecs = [CodecEnum.OPUS, CodecEnum.FLAC]
+
+            if codec_options.spatial_codecs:
+                if self.settings["prefer_spatial_mha1"]:
+                    preferred_codecs.append(CodecEnum.MHA1)
+                else:
+                    preferred_codecs.append(CodecEnum.MHM1)
+
+                if self.settings["prefer_spatial_ac4"]:
+                    preferred_codecs.append(CodecEnum.AC4)
+                else:
+                    preferred_codecs.append(CodecEnum.EAC3)
+
+            mapped_tracks = self.tracks_to_quality_map(
+                avaliable_tracks, preferred_codecs
             )
-            LOGGER.debug(avaliable_usable_qualities)
+            LOGGER.debug(mapped_tracks)
 
-            # Select the highest quality avaliable, start iterating at max first
-            # NOTE there *could* be a different way of doing this, i'm just stupid af
             track_to_use = None
-            for oquality, qualities in reversed(self.quality_parse.items()):
-                if oquality not in avaliable_usable_qualities:
-                    continue
-                for quality in qualities:
-                    # Reversed because best quality is lowest integer (AudioTrack.quality_ranking)
-                    avaliable_tracks_of_quality = natsort.natsorted(
-                        filter(
-                            lambda c: c.quality.startswith(quality), avaliable_tracks
-                        ),
-                        key=lambda x: x.quality_ranking,
-                        reverse=True,
-                    )
-                    if not avaliable_tracks_of_quality:
+            # I tried, ok?
+            # Attempt to find and choose preferred quality (has to be the same returned in the MPD)
+            if max_track_quality_to_use := self.settings["max_track_quality_to_use"]:
+                max_track_quality_to_use = str(max_track_quality_to_use).upper()
+                for (
+                    quality_enum,
+                    quality_name,
+                    tracks,
+                ) in self._iter_over_tracks_to_quality_map(mapped_tracks):
+                    if not tracks:
                         continue
-                    if len(avaliable_tracks_of_quality) > 1:
-                        LOGGER.warning(
-                            f"There are more than one tracks avaliable for {quality}. "
-                            f'Avaliable qualities: {", ".join("{} - {}".format(item.quality, item.quality_ranking) for item in avaliable_tracks_of_quality)}'
-                        )
-                    track_to_use = avaliable_tracks_of_quality[0]
+
+                    # Check if the selected MPD quality to use is valid
+                    if max_track_quality_to_use not in quality_name:
+                        continue
+
+                    self.print(
+                        f"Downloading in {quality_name} as it is matched with {max_track_quality_to_use}."
+                    )
+
+                    for track in tracks:
+                        if not (track.quality.startswith(max_track_quality_to_use)):
+                            continue
+                        track_to_use = track
+                        break
+                    else:
+                        continue
                     break
 
-                if track_to_use is not None:
-                    break
+                if not track_to_use:
+                    self.print(
+                        f"Failed to find {max_track_quality_to_use!r}, defaulting to highest avaliable."
+                    )
+
+            # If max_track_quality_to_use is not set or failed, then use the global quality to use
+            if not track_to_use:
+                for (
+                    quality_enum,
+                    quality_name,
+                    tracks,
+                ) in self._iter_over_tracks_to_quality_map(mapped_tracks):
+                    if not tracks:
+                        continue
+
+                    if len(tracks) > 1:
+                        LOGGER.warning(
+                            f"There are more than one tracks avaliable for {quality_name}. "
+                            f"Avaliable qualities: "
+                            ", ".join(f"{item.quality} with ranking {item.quality_ranking}" for item in tracks)
+                        )
+                    if quality_enum.value <= quality_tier.value:
+                        track_to_use = tracks[0]
+                        break
+
+                    continue
+
+            if not isinstance(track_to_use, AudioTrack):
+                raise TypeError(f"{track_to_use=}, type: {type(track_to_use)}")
 
             LOGGER.debug(f"Using AudioTrack: {track_to_use}")
 
-            # Amazon Music doesn't have any "Disc" seperation, so it is typically assumed to be 1 however:
+            # Calculate the total disc avaliable by iterating each track and using the highest value
             disc_total = max(int(t["discNum"]) for t in album_data.get("tracks", [{}]))
             composers = "; ".join(
                 natsort.natsorted(
@@ -334,7 +371,7 @@ class ModuleInterface:
                 tags=tags,
                 codec=track_to_use.codec,
                 cover_url=artwork_url,  # make sure to check module_controller.orpheus_options.default_cover_options
-                release_year=release_datetime,
+                release_year=int(release_datetime.strftime("%Y")),
                 explicit=track_data["parentalControls"]["hasExplicitLanguage"],
                 artist_id=track_data["artist"]["asin"],  # optional
                 duration=track_data["duration"],
@@ -358,7 +395,7 @@ class ModuleInterface:
                 error="",  # only use if there is an error
             )
         except Exception as e:
-            LOGGER.error(e, exc_info=1)
+            LOGGER.error(e, exc_info=True)
 
     # def get_track_download(self, file_url: str, codec: CodecEnum, pssh: PSSH, **kwargs):
     def get_track_download(self, audio_track: AudioTrack, **kwargs):
@@ -424,7 +461,7 @@ class ModuleInterface:
             silentremove(decrypted_track_location)
 
         except Exception as e:
-            LOGGER.error(e, exc_info=1)
+            LOGGER.error(e, exc_info=True)
             if session_id:
                 self.cdm.close(session_id)
             return
@@ -435,13 +472,13 @@ class ModuleInterface:
         )
 
     def get_album_info(
-        self, album_id: str, data={}
+        self, album_id: str, data: dict = {}
     ) -> Optional[AlbumInfo]:  # Mandatory if ModuleModes.download
         # raise NotImplementedError
         LOGGER.debug("Getting album info")
 
         try:
-            album_data = (
+            album_data = dict(
                 data[album_id]
                 if album_id in data
                 else self.mobile_session.get_album_info(album_id)
@@ -459,9 +496,11 @@ class ModuleInterface:
             )
             ai = AlbumInfo(
                 name=album_data.get("title", "Unknown"),
-                artist=album_data.get("primaryArtistName"),
+                artist=album_data.get("primaryArtistName", ""),
                 tracks=[track["asin"] for track in album_data.get("tracks", [])],
-                release_year=self._get_date_from_metadata(album_data).strftime("%Y"),
+                release_year=int(
+                    self._get_date_from_metadata(album_data).strftime("%Y")
+                ),
                 # explicit=False, #TODO iterate over tracks and use any()
                 duration=album_data.get("duration"),
                 artist_id=album_data.get("artist", {}).get("asin"),  # optional
@@ -484,7 +523,7 @@ class ModuleInterface:
             LOGGER.debug(ai)
             return ai
         except Exception as e:
-            LOGGER.error(e, exc_info=1)
+            LOGGER.error(e, exc_info=True)
 
     def get_playlist_info(
         self, playlist_id: str, data={}
@@ -519,8 +558,8 @@ class ModuleInterface:
         try:
             artist_data = self.mobile_session.get_metadata(artist_id)["artistList"][0]
         except Exception as e:
-            LOGGER.error(e, exc_info=1)
-            return
+            LOGGER.error(e, exc_info=True)
+            raise e
         else:
             artist_id = str(artist_data["asin"])
             artist_name = str(artist_data["name"])
@@ -595,7 +634,7 @@ class ModuleInterface:
         embedded_lyrics = ""
         synced_lyrics = ""
         if int(track_lyrics_resp.get("lyricsResponseCode", 0)) == 1002:
-            for line in track_lyrics_resp.get("lyrics", {"lines": []}).get("lines"):
+            for line in track_lyrics_resp.get("lyrics", {}).get("lines", {}):
                 text = line["text"]
 
                 start_time = int(line["startTime"])
@@ -612,7 +651,7 @@ class ModuleInterface:
         self,
         query_type: DownloadTypeEnum,
         query: str,
-        track_info: TrackInfo = None,
+        track_info: typing.Optional[TrackInfo] = None,
         limit: int = 10,
     ):  # Mandatory
         if (
@@ -777,6 +816,9 @@ class ModuleInterface:
         )
         is_listening = False
         while not is_listening:
+            if not rpc_proc.stdout:
+                continue
+
             line = rpc_proc.stdout.readline()
             if not line or not line.split():
                 continue
@@ -808,7 +850,7 @@ class ModuleInterface:
 
         return port
 
-    def _parse_track_mpd(self, mpd: dict, track_asin: str):
+    def _parse_track_mpd(self, mpd: dict[typing.Any, typing.Any], track_asin: str):
         """
         Iterate over the manifest to grab the tracks and append them to avaliable_tracks as a AudioTrack object
 
@@ -819,8 +861,8 @@ class ModuleInterface:
         avaliable_tracks: list[AudioTrack] = []
         # for period in manifest.findall("Period"):
         # for period in manifest.get("Period"):
-        for adaptation_set in manifest.get("AdaptationSet"):
-            adaptation_set: list
+        for adaptation_set in manifest.get("AdaptationSet", []):
+            adaptation_set: list[dict[typing.Any, typing.Any]]
             # LOGGER.debug(json.dumps(adaptation_set, indent=3))
             content_type = adaptation_set.get("@contentType")
             if content_type != "audio":
@@ -828,7 +870,6 @@ class ModuleInterface:
 
             key_id = None
             pssh = None
-            # print(dict(adaptation_set.items()))
 
             for content_property in adaptation_set.get("ContentProtection"):
                 # print(content_property)
@@ -881,7 +922,7 @@ class ModuleInterface:
                 muq = iter(re.split("=|&", urlparse(media_url).query))
                 media_url_query = dict(zip(muq, muq))
                 LOGGER.debug(media_url_query)
-                quality = media_url_query.get("ql")
+                quality = str(media_url_query.get("ql"))
 
                 codec = str(representation.get("@codecs")).upper()
                 # 360 Audio
@@ -931,3 +972,75 @@ class ModuleInterface:
             avaliable_tracks, key=lambda x: x.quality, reverse=False
         )
         return avaliable_tracks
+
+    @staticmethod
+    def _iter_over_tracks_to_quality_map(
+        mapping: dict[QualityEnum, dict[str, list[AudioTrack]]]
+    ):
+        for quality_enum, quality_items in mapping.items():
+            for quality_name, tracks in quality_items.items():
+                yield quality_enum, quality_name, tracks
+        return
+
+    def tracks_to_quality_map(
+        self,
+        tracks: typing.Iterable[AudioTrack],
+        preferred_codecs: typing.Iterable[CodecEnum],
+    ) -> dict[QualityEnum, dict[str, list[AudioTrack]]]:
+        """
+        Example output:
+
+        {
+            QualityEnum.HIFI: {
+                "SPATIAL_ATMOS_HIGH": [
+                    AudioTrack(),
+                ],
+                "SPATIAL_ATMOS_MEDIUM": [
+                    AudioTrack()
+                ]
+            },
+        }
+
+        """
+        quality_to_track_mapping = {}
+
+        for quality_enum, qualities in reversed(self.quality_parse.items()):
+
+            def key_for_sorting_avaliable_tracks(track: AudioTrack):
+                if "ATMOS" in track.quality:
+                    return track.bitrate
+                if "LD" in track.quality:
+                    return track.bitrate
+                if quality_enum.value <= QualityEnum.LOSSLESS.value:
+                    return track.quality_ranking
+
+            def key_for_filtering_audiotracks(track: AudioTrack):
+                for quality in qualities:
+                    if not (
+                        track.quality.startswith(quality)
+                        and track.codec in preferred_codecs
+                    ):
+                        continue
+                    return True
+                return False
+
+            def key_for_grouping_audiotracks(track: AudioTrack):
+                return track.quality
+
+            # AudioTracks are sorted best quality to worse
+
+            sorted_tracks = natsort.natsorted(
+                [item for item in tracks if key_for_filtering_audiotracks(item)],
+                key=key_for_sorting_avaliable_tracks,
+                reverse=True,
+            )
+            grouped_tracks = {
+                key: list(group)
+                for key, group in itertools.groupby(
+                    sorted_tracks, key=key_for_grouping_audiotracks
+                )
+            }
+
+            quality_to_track_mapping.update({quality_enum: grouped_tracks})
+
+        return quality_to_track_mapping

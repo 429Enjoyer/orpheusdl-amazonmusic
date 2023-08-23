@@ -110,7 +110,7 @@ class AmazonMusicMobileAPI:
 
     def __init__(
         self,
-        credentials: Optional[AmazonMusicMobileAPICredentials] = None,
+        credentials: AmazonMusicMobileAPICredentials,
     ) -> None:
         self.credentials = credentials
         self.session = self._create_httpx_session()
@@ -189,9 +189,7 @@ class AmazonMusicMobileAPI:
         )
 
         # Authorize device for usage on Amazon Music
-        auth_device_resp = dict(
-            inst._authorize_device(device_serial=serial).json()
-        )
+        auth_device_resp = dict(inst._authorize_device(device_serial=serial).json())
 
         inst.credentials.customer_id = auth_device_resp["device"]["customerId"]
 
@@ -254,7 +252,7 @@ class AmazonMusicMobileAPI:
             except httpx.HTTPError as ce:
                 time.sleep(10)
                 LOGGER.error(ce)
-                LOGGER.debug(ce, exc_info=1)
+                LOGGER.debug(ce, exc_info=True)
                 continue
             else:
                 # return the response if successful
@@ -394,15 +392,31 @@ class AmazonMusicMobileAPI:
         LOGGER.debug(json.dumps(resp_json, indent=2))
         return resp_json
 
-    @functools.lru_cache()
+    @typing.overload
+    def search(
+        self,
+        query: str,
+        asin: str,
+        search_types: typing.Optional[tuple[str, ...]] = None,
+        limit: typing.Optional[int] = 50,
+        metadata_locale: typing.Optional[str] = None,
+    ) -> dict[typing.Any, typing.Any]:
+        ...
+
+    @typing.overload
     def search(
         self,
         query: str,
         asin: typing.Optional[str] = None,
-        search_types: typing.Optional[tuple] = None,
+        search_types: typing.Optional[tuple[str, ...]] = None,
         limit: typing.Optional[int] = 50,
         metadata_locale: typing.Optional[str] = None,
-    ):
+    ) -> typing.Generator[dict[typing.Any, typing.Any], None, None]:
+        ...
+
+    def search(self, *args, **kwargs):
+        # mfw https://github.com/microsoft/pyright/issues/2414
+        # its annoying, so we do this as a workaround
         """
         Search for a item using a query.
 
@@ -416,7 +430,17 @@ class AmazonMusicMobileAPI:
             catalog_podcast_show, catalog_podcast_episode, live_event`
 
         """
+        return self._search(*args, **kwargs)
 
+    @functools.lru_cache()
+    def _search(
+        self,
+        query: str,
+        asin: typing.Optional[str] = None,
+        search_types: typing.Optional[tuple[str, ...]] = None,
+        limit: typing.Optional[int] = 50,
+        metadata_locale: typing.Optional[str] = None,
+    ):
         url = f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/textsearch/search/v1_1/"
         headers = {
             "x-amz-target": "com.amazon.tenzing.textsearch.v1_1.TenzingTextSearchServiceExternalV1_1.search",
@@ -424,7 +448,7 @@ class AmazonMusicMobileAPI:
             "X-Amz-Requestid": str(uuid.uuid4()).lower(),
         }
         if search_types is None:
-            search_types = ["catalog_album"]
+            search_types = ("catalog_album",)
 
         result_specs = [
             {
@@ -585,7 +609,7 @@ class AmazonMusicMobileAPI:
 
         return dict(response.json()["lyricsResponseList"][0])
 
-    def get_track_manifest(self, asin: str):
+    def get_track_manifest(self, asin: str) -> typing.OrderedDict[str, Any]:
         """
         Get the playback manifest of a track (MPD)
 
@@ -665,10 +689,10 @@ class AmazonMusicMobileAPI:
             raise Exception("Failed to get track manifest: tracklist is greater than 1")
         return resp[0]
 
-    def get_album_info(self, track_asin: str):
-        resp = self.get_metadata(track_asin)["albumList"]
+    def get_album_info(self, album_asin: str):
+        resp = self.get_metadata(album_asin)["albumList"]
         if len(resp) > 1:
-            raise Exception("Failed to get track manifest: tracklist is greater than 1")
+            raise Exception("Failed to get track manifest: albumList is greater than 1")
         return resp[0]
 
     def get_license_response(self, asin: str, challenge: str) -> str:
