@@ -1583,7 +1583,8 @@ class AmazonMusicMobileAPI:
             )
         )
 
-    def get_marketplace_id(self, country_code: str) -> str:
+    @staticmethod
+    def get_marketplace_id(country_code: str) -> str:
         """Returns the marketplace id for a given country code"""
         # NOTE: this can be retrived by parsing the appConfig from the root on the netloc
         # marketplace ID for amazon prime video japan: ART4WZ8MWBX2Y
