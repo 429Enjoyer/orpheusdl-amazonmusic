@@ -55,18 +55,17 @@ You can set any one of this strings, as they are valid, as long as it is avaliab
     - `UHD_48`
 
 ## Spatial audio (Sony 360RA, Dolby Atmos)
-- `SPATIAL_ATMOS` - Dolby Atmos
+- `SPATIAL_ATMOS` - Dolby Atmos (Codecs: E-AC-3 and/or AC-3)
     - `SPATIAL_ATMOS_LOW`
     - `SPATIAL_ATMOS_MEDIUM`
     - `SPATIAL_ATMOS_HIGH`
-- `SPATIAL_RA360` - Sony 360RA
+
+- `SPATIAL_RA360` - Sony 360RA (Codecs: MHM1 and MHA1)
     - `SPATIAL_RA360_L0`
     - `SPATIAL_RA360_L1`
     - `SPATIAL_RA360_L2`
     - `SPATIAL_RA360_L3`
-    
 
-Codecs: E-AC-3 and/or AC-3
 
 ## Changelog
 Brief summary of modifications made to this module.
