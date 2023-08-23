@@ -27,7 +27,7 @@ python orpheus.py settings refresh
 
 5. Inside `settings.json`, find the name of the cloned module (usually `amazon` or `amazonmusic`) and fill in each field.
 
-# Module specifics settings
+## Module specifics settings
 
 `wvd_path`: The full path to your dumped [.wvd / CDM](https://bunny.net/academy/streaming/what-is-widevine-cdm-content-decryption-module/).
 
@@ -40,7 +40,7 @@ To create a `.wvd` file using your newly dumped L3 CDM ([example](https://github
 
 If `proprietary_codecs` inside your settings is set to `false`, no 3D audio will be downloaded regardless if `max_track_quality_to_use` is set to one of the spatial audio options.
 
-You can set any one of this strings, as they are valid, as long as it is avaliable for streaming.
+You can set any of these strings since they are valid, as long as the quality is avaliable for streaming.
 
 - `LD` - The lowest definition Amazon provides. typically in Opus.
     - `LD_MEDIUM`
@@ -54,7 +54,7 @@ You can set any one of this strings, as they are valid, as long as it is avaliab
 - `UHD` - Ultra HD, typically 24 bit in FLAC.
     - `UHD_48`
 
-## Spatial audio (Sony 360RA, Dolby Atmos)
+### Spatial audio (Sony 360RA, Dolby Atmos)
 - `SPATIAL_ATMOS` - Dolby Atmos (Codecs: E-AC-3 and/or AC-3)
     - `SPATIAL_ATMOS_LOW`
     - `SPATIAL_ATMOS_MEDIUM`
