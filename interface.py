@@ -527,12 +527,10 @@ class ModuleInterface:
 
         albums = []
 
-        for album in self.mobile_session.get_documents_from_search_results(
-            self.mobile_session.search(
-                query=f"{artist_name}",
-                search_types=tuple(["catalog_album"]),
-                limit=500,
-            )
+        for album in self.mobile_session.search(
+            query=f"{artist_name}",
+            search_types=tuple(["catalog_album"]),
+            limit=500,
         ):
             if album.get("artistAsin") != artist_id:
                 continue
@@ -636,10 +634,8 @@ class ModuleInterface:
         #     ))
         if not results:
             results = list(
-                self.mobile_session.get_documents_from_search_results(
-                    self.mobile_session.search(
-                        query=query, search_types=tuple([search_type]), limit=limit
-                    )
+                self.mobile_session.search(
+                    query=query, search_types=tuple([search_type]), limit=limit
                 )
             )
 
