@@ -188,6 +188,13 @@ class AmazonMusicMobileAPI:
             f"Login confirmed for {inst.credentials.customer_info.get('name', 'Unknown user')} on {application.official_name}"
         )
 
+        # Authorize device for usage on Amazon Music
+        auth_device_resp = dict(
+            inst._authorize_device(device_serial=serial).json()
+        )
+
+        inst.credentials.customer_id = auth_device_resp["device"]["customerId"]
+
         # check home data, not required
         # TODO: move to seperate function
         # customer_home_resp = self.session.post(
@@ -546,11 +553,11 @@ class AmazonMusicMobileAPI:
         """
         tld = self.credentials.tld
         if self.credentials.tld not in ("co.jp", "com"):
-            if self.credentials.web_client_config == "FE":
+            if self.credentials.web_client_config.region == "FE":
                 tld = "co.jp"
-            elif self.credentials.web_client_config == "NA":
+            elif self.credentials.web_client_config.region == "NA":
                 tld = "com"
-            elif self.credentials.web_client_config == "EU":
+            elif self.credentials.web_client_config.region == "EU":
                 tld = "com"
             else:
                 print(
@@ -888,13 +895,6 @@ class AmazonMusicMobileAPI:
             customer_info=customer_info,
             tld=domain,
         )
-
-        # authorize device for usage on Amazon Music
-        auth_device_resp = dict(
-            cls._authorize_device(credentials, device_serial=serial).json()
-        )
-
-        credentials.customer_id = auth_device_resp["device"]["customerId"]
 
         return cls(credentials)
 
@@ -1312,7 +1312,7 @@ class AmazonMusicMobileAPI:
 
     def _list_devices(self):
         devices_resp = self.post(
-            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_app_config.region}/api/stratus/",
+            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/stratus/",
             data={
                 "customerId": None,
                 "deviceId": self.credentials.device_info["device_serial_number"],
@@ -1328,9 +1328,8 @@ class AmazonMusicMobileAPI:
         )
         return devices_resp
 
-    @staticmethod
     def _authorize_device(
-        credentials: AmazonMusicMobileAPICredentials,
+        self,
         device_serial: Optional[str] = None,
         device_type: Optional[str] = None,
         home_region: Optional[str] = None,
@@ -1340,15 +1339,15 @@ class AmazonMusicMobileAPI:
             device_type = AmazonMobileApplication.MUSIC.device_type
 
         if not device_serial:
-            device_serial = credentials.device_info["device_serial_number"]
+            device_serial = self.credentials.device_info["device_serial_number"]
 
         if not home_region:
-            home_region = credentials.customer_info["home_region"]
+            home_region = self.credentials.customer_info["home_region"]
 
         if not domain:
-            domain = credentials.tld
+            domain = self.credentials.tld
 
-        auth_device_resp = httpx.post(
+        auth_device_resp = self.post(
             url=f"https://music.amazon.{domain}/{home_region}/api/stratus/",
             data={
                 "capabilities": [
@@ -1370,6 +1369,7 @@ class AmazonMusicMobileAPI:
                 "x-amzn-RequestId": str(uuid.uuid4()),
             },
         )
+        print("thing is here")
         LOGGER.debug(auth_device_resp.content)
         auth_device_resp_json = auth_device_resp.json()
         LOGGER.debug(
