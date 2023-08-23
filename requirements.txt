@@ -2,9 +2,10 @@ aria2p==0.11.3
 audible==0.8.2
 beautifulsoup4==4.12.2
 ffmpeg_python==0.2.0
-httpx==0.24.1
+httpx==0.23.3
 natsort==8.4.0
 pycryptodome==3.18.0
+protobuf==4.21.6
 pywidevine==1.6.0
 rsa==4.9
 tqdm==4.66.1
