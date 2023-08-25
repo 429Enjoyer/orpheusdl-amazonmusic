@@ -868,7 +868,7 @@ class ModuleInterface:
 
                 if to_print:
                     self.print(
-                        f"Downloading in {quality_name} as it is matched with {max_track_quality_to_use}."
+                        f"{module_information.service_name}: Downloading in {quality_name} as it is matched with {max_track_quality_to_use}."
                     )
 
                 for track in tracks:
