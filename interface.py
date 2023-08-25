@@ -273,6 +273,7 @@ class ModuleInterface:
             track_to_use = self._get_usable_audio_track_of_mapped_quailty(
                 mapped_audio_tracks,
                 quality_tier,
+                to_print=True,
             )
 
             # Calculate the total disc avaliable by iterating each track and using the highest value
@@ -846,6 +847,7 @@ class ModuleInterface:
         self,
         mapped_audio_tracks: dict[QualityEnum, dict[str, list[AudioTrack]]],
         quality_tier: QualityEnum,
+        to_print: typing.Optional[bool] = False
     ):
         track_to_use = None
         # I tried, ok?
@@ -864,9 +866,10 @@ class ModuleInterface:
                 if max_track_quality_to_use not in quality_name:
                     continue
 
-                self.print(
-                    f"Downloading in {quality_name} as it is matched with {max_track_quality_to_use}."
-                )
+                if to_print:
+                    self.print(
+                        f"Downloading in {quality_name} as it is matched with {max_track_quality_to_use}."
+                    )
 
                 for track in tracks:
                     if not (track.quality.startswith(max_track_quality_to_use)):
@@ -893,7 +896,7 @@ class ModuleInterface:
                 if not tracks:
                     continue
 
-                if len(tracks) > 1:
+                if len(tracks) > 1 and to_print:
                     LOGGER.warning(
                         f"There are more than one tracks avaliable for {quality_name}. "
                         f"Avaliable qualities: "
