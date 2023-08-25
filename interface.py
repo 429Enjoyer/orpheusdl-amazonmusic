@@ -230,7 +230,7 @@ class ModuleInterface:
                 data[f"{album_id}_search"]
                 if data and f"{album_id}_search" in data
                 else self.mobile_session.search(
-                    query="{}, {} - {}".format(
+                    query='{}, "{}" - "{}"'.format(
                         album_data["artist"]["name"],
                         album_data["title"],
                         track_data["title"],
@@ -462,7 +462,7 @@ class ModuleInterface:
             data[f"{album_id}_search"]
             if data and f"{album_id}_search" in data
             else self.mobile_session.search(
-                query=f"{album_data['artist']['name']} - {album_data['title']}",
+                query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
                 asins=(album_id, album_data['requestedAsin']),
                 limit=100,
             )
@@ -560,18 +560,18 @@ class ModuleInterface:
         albums = []
 
         for album in self.mobile_session.search(
-            query=f"{artist_name}",
+            query=f'"{artist_name}"',
             search_types=tuple(["catalog_album"]),
-            limit=500,
+            limit=1000,
         ):
-            if album.get("artistAsin") != artist_id:
+            if artist_name not in album.get("artistName", ""):
                 continue
-            if album.get("artistName") != artist_name and not get_credited_albums:
+            # Assume that if they aren't equal, they are credited albums
+            # artist_id != album.get("artistAsin")
+            if artist_name != album.get("artistName", "") and not get_credited_albums:
                 continue
+                        
             albums.append(album)
-
-        # LOGGER.debug(json.dumps(artist_data, indent=3))
-        # LOGGER.debug(json.dumps(albums, indent=3))
 
         if not albums:
             return ArtistInfo(name=artist_name)
@@ -880,7 +880,7 @@ class ModuleInterface:
                     continue
                 break
 
-            if not track_to_use:
+            if not track_to_use and to_print:
                 self.print(
                     f"{module_information.service_name}: Failed to find {max_track_quality_to_use!r}, defaulting to highest avaliable."
                 )
