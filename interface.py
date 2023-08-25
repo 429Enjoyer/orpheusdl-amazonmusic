@@ -1,5 +1,4 @@
 import base64
-import functools
 import logging
 from pathlib import Path
 import re
@@ -226,32 +225,35 @@ class ModuleInterface:
             )
             album_id = str(album_data["asin"])
             
-            # Searching for the album ASIN using "catalog_track"
-            # seems to work best
             search_data = (
                 data[f"{album_id}_search"]
                 if data and f"{album_id}_search" in data
                 else self.mobile_session.search(
-                    query="{} - {}".format(
-                        # album_data["artist"]["name"],
+                    query="{}, {} - {}".format(
+                        album_data["artist"]["name"],
                         album_data["title"],
                         track_data["title"],
                     ),
-                    asin=album_id,
-                    search_types=tuple(["catalog_track"]),
+                    asins=(album_id, track_id, str(track_data['globalAsin'])),
+                    search_types=("catalog_track", "catalog_album"),
                 )
                 or {}
             )
             # import pprint
             # pprint.pprint(search_data)
 
-            # NOTE the main artist is inside contributors because its amazon
-            contributors = [
-                str(item["name"])
-                for item in self.mobile_session.get_metadata(
-                    tuple(track_data["artist"]["contributorAsins"])
-                )["artistList"]
-            ]
+            contributors: list[str] = []
+            # NOTE the main artist is inside contributors only if the album as one or more contributors
+            if contributor_asins := tuple(track_data["artist"]["contributorAsins"]):
+                contributors.extend(
+                    str(item["name"])
+                    for item in self.mobile_session.get_metadata(
+                        contributor_asins
+                    )["artistList"]
+                )
+            else:
+                # Fallback, include the main artist only
+                contributors.append(album_data["artist"]["name"])
 
             release_datetime = self._get_date_from_metadata(album_data)
             mapped_audio_tracks = (
@@ -301,13 +303,13 @@ class ModuleInterface:
             genres = [
                 # sanitize and format the genre name from search data
                 # this genre tends to be more specific
-                " ".join(re.split("_| ", str(search_data["primaryGenre"]))).title()
+                " ".join(re.split("_| ", str(search_data.get("primaryGenre", "")))).title()
             ]
             if album_data["productDetails"]["primaryGenreName"] not in genres:
-                # this genre name tends to be much more broad
+                # this genre name tends to be broad
                 genres.append(album_data["productDetails"]["primaryGenreName"])
 
-            tags = Tags(  # every single one of these is optional
+            tags = Tags(
                 album_artist=album_data["primaryArtistName"],
                 composer=composers,
                 copyright=album_data["productDetails"]["copyright"],
@@ -459,7 +461,7 @@ class ModuleInterface:
             if data and f"{album_id}_search" in data
             else self.mobile_session.search(
                 query=f"{album_data['artist']['name']} - {album_data['title']}",
-                asin=album_id,
+                asins=(album_id, album_data['requestedAsin']),
                 limit=100,
             )
         )
@@ -663,7 +665,7 @@ class ModuleInterface:
         if not results:
             results = list(
                 self.mobile_session.search(
-                    query=query, search_types=tuple([search_type]), limit=limit
+                    query=query, search_types=(search_type,), limit=limit
                 )
             )
 

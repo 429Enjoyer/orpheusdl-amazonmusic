@@ -237,6 +237,7 @@ class AmazonMusicMobileAPI:
         return inst
 
     @staticmethod
+    @functools.lru_cache()
     def _wait_for_response(session: httpx.Client, request: httpx.Request):
         # Sometimes we get a DNS resolve error (too many requests for manifest?), this attempts to retry 5 times
         attempt = 0
@@ -256,7 +257,7 @@ class AmazonMusicMobileAPI:
             else:
                 # return the response when successful
                 return resp
-        return
+        raise
 
     def post(
         self,
@@ -291,6 +292,9 @@ class AmazonMusicMobileAPI:
         return self._wait_for_response(self.session, request)
 
     def get(self, url: str, headers: typing.Optional[dict] = None) -> httpx.Response:
+        if not headers:
+            headers = {}
+
         d_headers = {
             "User-Agent": self.APP_USER_AGENT,
             "X-Amz-RequestId": str(uuid.uuid4()),
@@ -340,7 +344,8 @@ class AmazonMusicMobileAPI:
         # TODO figure out how to get avaliable qualities through this api (see mobile and web requests to get what i mean)
         # Valid keywords to Amazon JP (unknown)
         # objectId,fileName,fileExtension,fileSize,creationDate,lastUpdatedDate,orderId,asin,purchaseDate,localFilePath,md5,status,purchased,uploaded,title,sortTitle,rating,marketplace,physicalOrderId,assetType,artistName,artistAsin,contributors,trackNum,discNum,primaryGenre,duration,bitrate,composer,songWriter,performer,lyricist,publisher,errorCode,instantImport,primeStatus,isMusicSubscription,albumName,albumAsin,albumArtistName,albumArtistAsin,albumContributors,albumRating,albumPrimaryGenre,albumReleaseDate,sortArtistName,sortAlbumName,sortAlbumArtistName,audioUpgradeDate,parentalControls,assetEligibility,eligibility,internalTags
-
+        if not asins:
+            raise ValueError(asins)
         asins = [asins] if isinstance(asins, str) else list(asins)
         response = self.post(
             url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/muse/",
@@ -373,9 +378,9 @@ class AmazonMusicMobileAPI:
                     "playlistLibraryAvailability",
                 ],
                 "filters": None,
-                "lang": "en_US",  # en_US i wonder if ja_JP would work for japanese | No it doesn't
+                "lang": "en_US",
                 "marketplaceId": None,
-                "metadataLang": None,  # ja_JP for tagging in japanese, blank for locale
+                "metadataLang": None,  # null for locale based on IP
                 "musicRequestIdentityContextToken": None,
                 "musicTerritory": self.credentials.web_client_config.music_territory,
                 "requestedContent": "ALL_STREAMABLE",  # FULL_CATALOG is valid too
@@ -395,10 +400,10 @@ class AmazonMusicMobileAPI:
     def search(
         self,
         query: str,
-        asin: str,
+        asins: tuple[str, ...],
         search_types: typing.Optional[tuple[str, ...]] = None,
         limit: typing.Optional[int] = 50,
-        metadata_locale: typing.Optional[str] = None,
+        locale: typing.Optional[str] = None,
     ) -> dict[typing.Any, typing.Any]:
         ...
 
@@ -406,10 +411,10 @@ class AmazonMusicMobileAPI:
     def search(
         self,
         query: str,
-        asin: typing.Optional[str] = None,
+        asins: typing.Optional[tuple[str, ...]] = None,
         search_types: typing.Optional[tuple[str, ...]] = None,
         limit: typing.Optional[int] = 50,
-        metadata_locale: typing.Optional[str] = None,
+        locale: typing.Optional[str] = None,
     ) -> typing.Generator[dict[typing.Any, typing.Any], None, None]:
         ...
 
@@ -420,7 +425,7 @@ class AmazonMusicMobileAPI:
         Search for a item using a query.
 
         Args:
-            asin: str (Optional): To return only the document in which the ASIN is included.
+            asins: A tuple of str (Optional): Return the document which matched with the nth index of ASINs.
             search_types: Iterable (tuple) (Optional): Search for a specific catalog type.
 
             Valid types are:
@@ -435,10 +440,10 @@ class AmazonMusicMobileAPI:
     def _search(
         self,
         query: str,
-        asin: typing.Optional[str] = None,
+        asins: typing.Optional[tuple[str]] = None,
         search_types: typing.Optional[tuple[str, ...]] = None,
         limit: typing.Optional[int] = 50,
-        metadata_locale: typing.Optional[str] = None,
+        locale: typing.Optional[str] = None,
     ):
         url = f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/textsearch/search/v1_1/"
         headers = {
@@ -448,6 +453,8 @@ class AmazonMusicMobileAPI:
         }
         if search_types is None:
             search_types = ("catalog_album",)
+        if not locale:
+            locale = "en_US"
 
         result_specs = [
             {
@@ -497,10 +504,10 @@ class AmazonMusicMobileAPI:
                 "spiritual": None,
                 "upsell": {"allowUpsellForCatalogContent": False},
             },
-            "locale": "en_US",  # TODO use custom locale
+            "locale": locale,
             "musicTerritory": self.credentials.web_client_config.music_territory,
             "query": query,
-            "queryMetadata": metadata_locale,
+            "queryMetadata": None,
             "resultSpecs": result_specs,
         }
 
@@ -512,10 +519,15 @@ class AmazonMusicMobileAPI:
         if not results:
             return None
 
-        if asin:
-            return self.find_item_by_asin_in_search_results(results, asin)
+        if not asins:
+            return self.get_documents_from_search_results(results)
+        
+        for asin in asins:
+            if result := self.find_item_by_asin_in_search_results(results, asin):
+                return result
+        else:
+            return
 
-        return self.get_documents_from_search_results(results)
 
     def get_recent_tracks(self):
         """
@@ -635,7 +647,7 @@ class AmazonMusicMobileAPI:
             }
             for asin in asins
         ]
-        music_agent = f"Harley/{self.harley_version} Harley/{self.application_version} ( {str(uuid.uuid4())} {asins[0]})"  # {asins[0]}
+        music_agent = f"Harley/{self.harley_version} Harley/{self.application_version} ( {str(uuid.uuid4())} {asins[0]} )"  # {asins[0]}
         response = self.post(
             url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/dmls/getDashManifestsV2",
             headers={
