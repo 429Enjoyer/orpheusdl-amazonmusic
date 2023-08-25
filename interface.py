@@ -34,6 +34,7 @@ class AudioTrack:
     asin: str
     codec: CodecEnum
     bitrate: int
+    """ As kilobits per second (kbps) """
     sample_rate: int
     url: str
     official_quality_name: str
@@ -431,7 +432,7 @@ class ModuleInterface:
             ffmpeg.input(decrypted_track_location).output(
                 final_decrypted_track_location,
                 loglevel="warning",
-                audio_bitrate=audio_track.bitrate,
+                audio_bitrate=f"{audio_track.bitrate}k",
             ).run()
             silentremove(decrypted_track_location)
 
