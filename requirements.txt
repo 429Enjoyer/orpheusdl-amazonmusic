@@ -10,7 +10,6 @@ pywidevine==1.6.0
 rsa==4.9
 tqdm==4.66.1
 xmltodict==0.13.0
-yt_dlp==2023.7.6
 python-dateutil
 brotli
 bs4

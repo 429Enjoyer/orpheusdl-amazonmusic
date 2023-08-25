@@ -13,7 +13,6 @@ import typing
 import uuid
 from datetime import datetime, timedelta
 from enum import Enum, auto
-from typing import Any, Optional
 from urllib.parse import parse_qs, urlencode
 from xml.etree import ElementTree
 
@@ -131,9 +130,9 @@ class AmazonMusicMobileAPI:
         password: str,
         domain: str = "com",
         country_code: str = "US",
-        serial: Optional[str] = None,
-        load_credentials: Optional[bool] = True,
-        application: Optional[AmazonMobileApplication] = None,
+        serial: typing.Optional[str] = None,
+        load_credentials: typing.Optional[bool] = True,
+        application: typing.Optional[AmazonMobileApplication] = None,
     ):
         if len(country_code) != 2:
             raise ValueError(
@@ -255,7 +254,7 @@ class AmazonMusicMobileAPI:
                 LOGGER.debug(ce, exc_info=True)
                 continue
             else:
-                # return the response if successful
+                # return the response when successful
                 return resp
         return
 
@@ -263,8 +262,8 @@ class AmazonMusicMobileAPI:
         self,
         url: str,
         data: dict | None,
-        headers: Optional[dict] = None,
-        sign: Optional[bool] = True,
+        headers: typing.Optional[dict] = None,
+        sign: typing.Optional[bool] = True,
     ) -> httpx.Response:
         # these headers assume that the url is https://music.amazon.com/NA/api/stratus/
         # TODO have a enum representing the the api endpoints for the different headers
@@ -291,7 +290,7 @@ class AmazonMusicMobileAPI:
         self._apply_cookies_auth_flow(request)
         return self._wait_for_response(self.session, request)
 
-    def get(self, url: str, headers: Optional[dict] = None) -> httpx.Response:
+    def get(self, url: str, headers: typing.Optional[dict] = None) -> httpx.Response:
         d_headers = {
             "User-Agent": self.APP_USER_AGENT,
             "X-Amz-RequestId": str(uuid.uuid4()),
@@ -322,7 +321,7 @@ class AmazonMusicMobileAPI:
     @functools.lru_cache()
     def get_metadata(
         self, asins: str | typing.Sequence[str]
-    ) -> dict[str, list[dict[str, Any]]]:
+    ) -> dict[str, list[dict[str, typing.Any]]]:
         """
         Get metadata for a track, album, playlist or artist.
 
@@ -544,10 +543,10 @@ class AmazonMusicMobileAPI:
         }
         resp = self.post(url=url, headers=headers, data=data, sign=True)
 
-        print(json.dumps(resp.json(), indent=3))
+        # print(json.dumps(resp.json(), indent=3))
         return resp.json()
 
-    def get_track_lyrics(self, track_asin: str) -> dict[str, Any]:
+    def get_track_lyrics(self, track_asin: str) -> dict[str, typing.Any]:
         """
         Get the lyrics for a track.
 
@@ -582,7 +581,7 @@ class AmazonMusicMobileAPI:
             elif self.credentials.web_client_config.region == "NA":
                 tld = "com"
             elif self.credentials.web_client_config.region == "EU":
-                tld = "com"
+                tld = "eu"
             else:
                 print(
                     "Warning! This type of TLD is not recognized, \n"
@@ -609,17 +608,34 @@ class AmazonMusicMobileAPI:
 
         return dict(response.json()["lyricsResponseList"][0])
 
-    def get_track_manifest(self, asin: str) -> typing.OrderedDict[str, Any]:
+    def get_tracks_manifest(self, asins: typing.Iterable[str]):
         """
-        Get the playback manifest of a track (MPD)
+        Get the playback manifest of tracks (MPD)
 
         Returns:
-        The Amazon Music Dash Manifest as a `xml.etree.ElementTree`
+        A generator which yields a tuple of the corresponding track ASIN and
+        the Amazon Music Dash Manifest as a `xml.etree.ElementTree`
 
         TRACK_PSSH + SIREN_KATANA = All audio format (Lossless and 360).
         TRACK_PSSH + SIREN_KATANA_NO_CLEAR_LEAD = No issues, only up to lossless
         """
-        music_agent = f"Harley/{self.harley_version} Harley/{self.application_version} ( {str(uuid.uuid4())} {asin} )"
+        # Amazon only allows a specific amount of ASINs to be requested at once (10 asins)
+        # I love when my methods are CPU-bound!!
+        for item in divide_sequence(list(asins), size=10):
+            yield from self.parse_from_content_responses(
+                self._get_tracks_manifest(tuple(item))
+            )
+
+    def _get_tracks_manifest(self, asins: tuple[str]):
+        """Internal function of get_tracks_manifest"""
+        content_id_list = [
+            {
+                "identifier": asin,
+                "identifierType": "ASIN",
+            }
+            for asin in asins
+        ]
+        music_agent = f"Harley/{self.harley_version} Harley/{self.application_version} ( {str(uuid.uuid4())} {asins[0]})"  # {asins[0]}
         response = self.post(
             url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/dmls/getDashManifestsV2",
             headers={
@@ -630,12 +646,7 @@ class AmazonMusicMobileAPI:
             },
             data={
                 "appInfo": {"musicAgent": music_agent},
-                "contentIdList": [
-                    {
-                        "identifier": asin,
-                        "identifierType": "ASIN",
-                    }
-                ],
+                "contentIdList": content_id_list,
                 "contentProtectionList": [
                     # "GROUP_PSSH", # for entitlement key
                     "TRACK_PSSH",  # web playback uses TRACK_PSSH, whereas mobile playback uses GROUP_PSSH
@@ -674,26 +685,9 @@ class AmazonMusicMobileAPI:
             )
 
         # return xmltodict.parse(resp_dict["contentResponseList"][0]["manifest"])
-        manifest = resp_dict["contentResponseList"][0]["manifest"]
-        return xmltodict.parse(manifest)
-        # Removes default namespace definition, don't do that!
-        # manifest = re.sub(r'xmlns="[^"]+"', '', manifest, count=1)
-        # return ElementTree.fromstring(manifest)
-        # return resp_dict["contentResponseList"][0]["manifest"]
-
-    # Shortcuts
-
-    def get_track_info(self, track_asin: str):
-        resp = self.get_metadata(track_asin)["trackList"]
-        if len(resp) > 1:
-            raise Exception("Failed to get track manifest: tracklist is greater than 1")
-        return resp[0]
-
-    def get_album_info(self, album_asin: str):
-        resp = self.get_metadata(album_asin)["albumList"]
-        if len(resp) > 1:
-            raise Exception("Failed to get track manifest: albumList is greater than 1")
-        return resp[0]
+        # yield from self.parse_from_content_responses(resp_dict["contentResponseList"])
+        result: list[dict] = resp_dict.get("contentResponseList", [])
+        return result
 
     def get_license_response(self, asin: str, challenge: str) -> str:
         """
@@ -741,6 +735,29 @@ class AmazonMusicMobileAPI:
             )
 
         return response.json()["license"]
+
+    # Shortcuts
+
+    def get_track_manifest(self, track_asin: str):
+        for asin, mpd in self.parse_from_content_responses(
+            self._get_tracks_manifest((track_asin,))
+        ):
+            return asin, mpd
+        else:
+            # for unpacking
+            return None, None
+
+    def get_track_info(self, track_asin: str):
+        resp = self.get_metadata(track_asin)["trackList"]
+        if len(resp) > 1:
+            raise Exception("Failed to get track manifest: tracklist is greater than 1")
+        return resp[0]
+
+    def get_album_info(self, album_asin: str):
+        resp = self.get_metadata(album_asin)["albumList"]
+        if len(resp) > 1:
+            raise Exception("Failed to get track manifest: albumList is greater than 1")
+        return resp[0]
 
     def get_artist_page(self, asin: str):
         response = self.post(
@@ -800,12 +817,40 @@ class AmazonMusicMobileAPI:
             return document
         return
 
-    def get_documents_from_search_results(self, results: dict):
+    @staticmethod
+    def get_documents_from_search_results(results: dict):
         for category in results:
             if int(category["totalHitCount"]) == 0:
                 continue
             for hit in category["hits"]:
                 yield dict(hit["document"])
+
+    @staticmethod
+    def parse_from_content_responses(content_responses: list[dict[str, typing.Any]]):
+        for content_response in content_responses:
+            content_identifier = content_response.get("contentIdentifier", {})
+            if not (content_identifier or isinstance(content_identifier, dict)):
+                raise ValueError(type(content_identifier))
+
+            if content_identifier.get("identifierType") != "ASIN":
+                raise ValueError(
+                    f"{content_identifier.get('identifierType')} is not an ASIN!"
+                )
+            asin = str(content_identifier.get("identifier", ""))
+
+            manifest = None
+            if content_response.get("contentResponseStatusCode") == "SUCCESS":
+                manifest = ElementTree.fromstring(
+                    re.sub(
+                        r'xmlns="[^"]+"',
+                        "",
+                        content_response.get("manifest", ""),
+                        count=1,
+                    )
+                )
+
+            yield asin, manifest
+        return
 
     @classmethod
     def register(
@@ -970,7 +1015,7 @@ class AmazonMusicMobileAPI:
 
     @staticmethod
     def _build_client_id(
-        serial: str, app: Optional[AmazonMobileApplication] = None
+        serial: str, app: typing.Optional[AmazonMobileApplication] = None
     ) -> str:
         if app is not None:
             device_type = app.device_type
@@ -1020,9 +1065,9 @@ class AmazonMusicMobileAPI:
         application: AmazonMobileApplication,
         market_place_id: str,
         country_code: str,
-        serial: Optional[str] = None,
-        region: Optional[str] = None,
-        assoc_handle: Optional[str] = None,
+        serial: typing.Optional[str] = None,
+        region: typing.Optional[str] = None,
+        assoc_handle: typing.Optional[str] = None,
     ) -> tuple[str, str]:
         """Builds the url to login to Amazon Music."""
 
@@ -1354,10 +1399,10 @@ class AmazonMusicMobileAPI:
 
     def _authorize_device(
         self,
-        device_serial: Optional[str] = None,
-        device_type: Optional[str] = None,
-        home_region: Optional[str] = None,
-        domain: Optional[str] = None,
+        device_serial: typing.Optional[str] = None,
+        device_type: typing.Optional[str] = None,
+        home_region: typing.Optional[str] = None,
+        domain: typing.Optional[str] = None,
     ):
         if not device_type:
             device_type = AmazonMobileApplication.MUSIC.device_type
@@ -1393,7 +1438,6 @@ class AmazonMusicMobileAPI:
                 "x-amzn-RequestId": str(uuid.uuid4()),
             },
         )
-        print("thing is here")
         LOGGER.debug(auth_device_resp.content)
         auth_device_resp_json = auth_device_resp.json()
         LOGGER.debug(
@@ -1419,7 +1463,7 @@ class AmazonMusicMobileAPI:
         LOGGER.debug(f"{response.status_code} {json.dumps(resp_json, indent=4)}")
         return dict(resp_json)
 
-    def _deauthorize_device(self, device_serial: Optional[str]):
+    def _deauthorize_device(self, device_serial: typing.Optional[str]):
         # remove device from authorized devices in amazon music
         return
 
@@ -1618,3 +1662,19 @@ class AmazonMusicMobileAPI:
             "GB": "A1F83G8C2ARO7P",
             "AU": "A39IBJ37TRP1C6",
         }[country_code.upper()]
+
+
+# bruh
+
+T = typing.TypeVar("T")
+
+
+def divide_sequence(
+    seq: typing.Sequence[T], size: typing.Optional[int] = None
+) -> typing.Generator[typing.Sequence[T], None, None]:
+    """Divide a sequence into chunks of size `size`"""
+    if size is None:
+        size = 5
+
+    for index in range(0, len(seq), size):
+        yield seq[index : index + size]

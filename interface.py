@@ -1,4 +1,5 @@
 import base64
+import functools
 import logging
 from pathlib import Path
 import re
@@ -18,7 +19,7 @@ import ffmpeg
 import natsort
 from pywidevine import PSSH, Cdm, Device
 from tqdm import tqdm
-from yt_dlp import YoutubeDL
+from xml.etree import ElementTree
 
 
 from utils.models import *
@@ -36,9 +37,10 @@ class AudioTrack:
     bitrate: int
     sample_rate: int
     url: str
-    pssh: PSSH
+    official_quality_name: str
     quality: str
     quality_ranking: int
+    pssh: PSSH
     bit_depth: Optional[int] = None
 
     def to_dict(self):
@@ -58,32 +60,36 @@ module_information = ModuleInformation(  # Only service_name and module_supporte
     # hidden: hides module from CLI help options
     # jwt_system_enable: handles bearer and refresh tokens automatically, though currently untested
     # private: override any public modules, only enabled with the -p/--private argument, currently broken
-    global_settings={},
+    global_settings={
+        "wvd_path": "",
+        "force_non_spatial": False,
+        "prefer_spatial_mha1": False,
+        "prefer_spatial_ac4": False,
+        "prefer_aria2c": False,
+        "max_track_quality_to_use": "",
+    },
     global_storage_variables=[],
     session_settings={
         "email": "",
         "password": "",
         "country": "",
         "country_tld": "",
-        "wvd_path": "",
-        "prefer_aria2c": False,
-        "prefer_spatial_mha1": False,
-        "prefer_spatial_ac4": False,
-        "max_track_quality_to_use": "",
     },
     session_storage_variables=["credentials"],
     netlocation_constant="amazon",
     test_url="https://music.amazon.com/albums/B08TZPYLJN",
     login_behaviour=ManualEnum.manual,  # setting to ManualEnum.manual disables Orpheus automatically calling login() when needed
-    url_decoding=ManualEnum.manual  # setting to ManualEnum.manual disables Orpheus' automatic url decoding which works as follows:
-    # taking the url_constants dict as a list of constants to check for in the url's segments, and the final part of the URL as the ID
+    url_decoding=ManualEnum.manual,  # setting to ManualEnum.manual disables Orpheus' automatic url decoding which works as follows:
 )
 
 
 class ModuleInterface:
     def __init__(self, module_controller: ModuleController):
         self.settings = module_controller.module_settings
+        self.options = module_controller.orpheus_options
         self.module_controller = module_controller
+        self.print = module_controller.printer_controller.oprint
+
         # Items highest are iterated first
         self.quality_parse = {
             QualityEnum.MINIMUM: [
@@ -99,11 +105,17 @@ class ModuleInterface:
                 "SD_HIGH",
             ],
             QualityEnum.LOSSLESS: [
-                "UHD",
                 "HD",
             ],
-            QualityEnum.HIFI: ["SPATIAL_RA360", "SPATIAL_ATMOS"],
+            QualityEnum.HIFI: ["UHD"],
         }
+        if not self.settings["force_non_spatial"]:
+            self.quality_parse[QualityEnum.HIFI] = [
+                "UHD",
+                "SPATIAL_RA360",
+                "SPATIAL_ATMOS",
+            ]
+
         # if not module_controller.orpheus_options.disable_subscription_check and (
         #     self.quality_parse[module_controller.orpheus_options.quality_tier]
         #     > self.mobile_session.get_user_tier()
@@ -111,7 +123,6 @@ class ModuleInterface:
         #     print(
         #         "Example: quality set in the settings is not accessible by the current subscription"
         #     )
-        self.print = module_controller.printer_controller.oprint
 
         self.cdm = Cdm.from_device(Device.load(self.settings["wvd_path"]))
 
@@ -131,7 +142,6 @@ class ModuleInterface:
         module_controller.temporary_settings_controller.set(
             "credentials", self.mobile_session.credentials.to_dict()
         )
-        LOGGER.debug(self.mobile_session._retrieve_capability())
         LOGGER.debug(self.mobile_session.credentials)
 
     def login_onto_mobile(
@@ -144,6 +154,7 @@ class ModuleInterface:
             raise Exception("Login failed")
 
         self.mobile_session = mobile_session
+        LOGGER.debug(self.mobile_session._retrieve_capability())
 
         return self.mobile_session
 
@@ -191,6 +202,14 @@ class ModuleInterface:
         codec_options: CodecOptions,
         data: dict = {},
     ) -> TrackInfo:  # Mandatory
+        if (
+            codec_options.spatial_codecs is False
+            and not self.settings["force_non_spatial"]
+        ):
+            self.print(
+                f"{module_information.service_name}: Warning: force_non_spatial is not set to True in settings.json"
+            )
+            self.print(f"Spatial codecs will be downloaded unless this is changed!")
         try:
             # quality_to_use = self.quality_parse[quality_tier]
 
@@ -205,122 +224,62 @@ class ModuleInterface:
                 if data and album_id in data
                 else self.mobile_session.get_album_info(album_id)
             )
+            album_id = str(album_data["asin"])
+            
+            # Searching for the album ASIN using "catalog_track"
+            # seems to work best
             search_data = (
                 data[f"{album_id}_search"]
                 if data and f"{album_id}_search" in data
                 else self.mobile_session.search(
-                    query=f"{album_data['title']} - {track_data['title']}",
-                    asin=track_id,
+                    query="{} - {}".format(
+                        # album_data["artist"]["name"],
+                        album_data["title"],
+                        track_data["title"],
+                    ),
+                    asin=album_id,
                     search_types=tuple(["catalog_track"]),
                 )
+                or {}
             )
-            # search_data_track = self.mobile_session.search(
-            #     query=f"{album_data['title']} - {track_data['title']}",
-            #     asin=track_id,
-            #     search_types=tuple(["catalog_track"]),
-            # )
-            # print(json.dumps(search_data_track, indent=3))
+            # import pprint
+            # pprint.pprint(search_data)
 
-            # TODO, unused for now
-            # artists = self.mobile_session.get_metadata(
-            #     [track_data["artist"]["asin"], *track_data["artist"]["contributorAsins"]], self.settings["country"]
-            # )["artistList"]
+            # NOTE the main artist is inside contributors because its amazon
+            contributors = [
+                str(item["name"])
+                for item in self.mobile_session.get_metadata(
+                    tuple(track_data["artist"]["contributorAsins"])
+                )["artistList"]
+            ]
 
             release_datetime = self._get_date_from_metadata(album_data)
-            mpd = self.mobile_session.get_track_manifest(track_id)
-            # LOGGER.debug(json.dumps(mpd, indent=3))
-            avaliable_tracks = self._parse_track_mpd(mpd, track_id)
-
-            # Sorting by bitrate helps retrieve the highest resolution avaliable
-            LOGGER.debug(avaliable_tracks)
-
-            preferred_codecs = [CodecEnum.OPUS, CodecEnum.FLAC]
-
-            if codec_options.spatial_codecs:
-                if self.settings["prefer_spatial_mha1"]:
-                    preferred_codecs.append(CodecEnum.MHA1)
-                else:
-                    preferred_codecs.append(CodecEnum.MHM1)
-
-                if self.settings["prefer_spatial_ac4"]:
-                    preferred_codecs.append(CodecEnum.AC4)
-                else:
-                    preferred_codecs.append(CodecEnum.EAC3)
-
-            mapped_tracks = self.tracks_to_quality_map(
-                avaliable_tracks, preferred_codecs
+            mapped_audio_tracks = (
+                data[f"{track_id}_quality_mapping"]
+                if data and f"{track_id}_quality_mapping" in data
+                else None
             )
-            LOGGER.debug(mapped_tracks)
-
-            track_to_use = None
-            # I tried, ok?
-            # Attempt to find and choose preferred quality (has to be the same returned in the MPD)
-            if max_track_quality_to_use := self.settings["max_track_quality_to_use"]:
-                max_track_quality_to_use = str(max_track_quality_to_use).upper()
-                for (
-                    quality_enum,
-                    quality_name,
-                    tracks,
-                ) in self._iter_over_tracks_to_quality_map(mapped_tracks):
-                    if not tracks:
-                        continue
-
-                    # Check if the selected MPD quality to use is valid
-                    if max_track_quality_to_use not in quality_name:
-                        continue
-
-                    self.print(
-                        f"Downloading in {quality_name} as it is matched with {max_track_quality_to_use}."
+            if not mapped_audio_tracks:
+                asin, mpd = self.mobile_session.get_track_manifest(track_id)
+                if not (asin and mpd):
+                    raise RuntimeError(
+                        f"Failed to obtain track manifest for {track_id}"
                     )
+                mapped_audio_tracks = self.mpd_to_quality_map(mpd, asin)
 
-                    for track in tracks:
-                        if not (track.quality.startswith(max_track_quality_to_use)):
-                            continue
-                        track_to_use = track
-                        break
-                    else:
-                        continue
-                    break
-
-                if not track_to_use:
-                    self.print(
-                        f"Failed to find {max_track_quality_to_use!r}, defaulting to highest avaliable."
-                    )
-
-            # If max_track_quality_to_use is not set or failed, then use the global quality to use
-            if not track_to_use:
-                for (
-                    quality_enum,
-                    quality_name,
-                    tracks,
-                ) in self._iter_over_tracks_to_quality_map(mapped_tracks):
-                    if not tracks:
-                        continue
-
-                    if len(tracks) > 1:
-                        LOGGER.warning(
-                            f"There are more than one tracks avaliable for {quality_name}. "
-                            f"Avaliable qualities: "
-                            ", ".join(f"{item.quality} with ranking {item.quality_ranking}" for item in tracks)
-                        )
-                    if quality_enum.value <= quality_tier.value:
-                        track_to_use = tracks[0]
-                        break
-
-                    continue
-
-            if not isinstance(track_to_use, AudioTrack):
-                raise TypeError(f"{track_to_use=}, type: {type(track_to_use)}")
-
-            LOGGER.debug(f"Using AudioTrack: {track_to_use}")
+            track_to_use = self._get_usable_audio_track_of_mapped_quailty(
+                mapped_audio_tracks,
+                quality_tier,
+            )
 
             # Calculate the total disc avaliable by iterating each track and using the highest value
             disc_total = max(int(t["discNum"]) for t in album_data.get("tracks", [{}]))
-            composers = "; ".join(
-                natsort.natsorted(
-                    track_data.get("songWriters", [album_data["primaryArtistName"]])
-                )
+            composers = natsort.natsorted(
+                set(track_data.get("songWriters", []) + contributors)
             )
+
+            composers = "; ".join(composers)
+
             url = f"https://music.amazon.{self.mobile_session.credentials.tld}/albums/{album_id}?trackAsin={track_id}"
 
             extra_tags = {
@@ -339,6 +298,14 @@ class ModuleInterface:
                         )
                     }
                 )
+            genres = [
+                # sanitize and format the genre name from search data
+                # this genre tends to be more specific
+                " ".join(re.split("_| ", str(search_data["primaryGenre"]))).title()
+            ]
+            if album_data["productDetails"]["primaryGenreName"] not in genres:
+                # this genre name tends to be much more broad
+                genres.append(album_data["productDetails"]["primaryGenreName"])
 
             tags = Tags(  # every single one of these is optional
                 album_artist=album_data["primaryArtistName"],
@@ -352,7 +319,7 @@ class ModuleInterface:
                 total_tracks=int(album_data["trackCount"] or 1),  # None/0/1 if no discs
                 # replay_gain=0.0,
                 # replay_peak=0.0,
-                genres=[album_data["productDetails"]["primaryGenreName"]],
+                genres=genres,
                 label=album_data["productDetails"]["label"],
                 release_date=release_datetime.strftime(
                     "%Y-%m-%d"
@@ -361,13 +328,18 @@ class ModuleInterface:
                 extra_tags=extra_tags,
             )
 
-            artwork_url = search_data["artOriginal"]["artUrl"]
+            artwork_url = search_data.get("artOriginal", {}).get("artUrl")
+            if not artwork_url:
+                self.print(
+                    "Failed to get original artwork, using lower resolution cover art.."
+                )
+                artwork_url = album_data.get("image", "")
 
             return TrackInfo(
                 name=track_data["title"],
                 album_id=album_id,
                 album=track_data["album"]["title"],
-                artists=[album_data["artist"]["name"]],
+                artists=contributors,
                 tags=tags,
                 codec=track_to_use.codec,
                 cover_url=artwork_url,  # make sure to check module_controller.orpheus_options.default_cover_options
@@ -379,7 +351,7 @@ class ModuleInterface:
                 # description="",  # optional
                 bit_depth=track_to_use.bit_depth,  # optional
                 sample_rate=track_to_use.sample_rate,  # optional
-                # bitrate=1411,  # optional
+                bitrate=track_to_use.bitrate,  # optional
                 download_extra_kwargs={
                     "audio_track": track_to_use,
                 },  # optional only if download_type isn't DownloadEnum.TEMP_FILE_PATH, whatever you want
@@ -396,6 +368,7 @@ class ModuleInterface:
             )
         except Exception as e:
             LOGGER.error(e, exc_info=True)
+            raise e
 
     # def get_track_download(self, file_url: str, codec: CodecEnum, pssh: PSSH, **kwargs):
     def get_track_download(self, audio_track: AudioTrack, **kwargs):
@@ -418,7 +391,7 @@ class ModuleInterface:
             ).decode("utf-8")
 
             license_response = self.mobile_session.get_license_response(
-                audio_track.asin, license_challenge
+                asin=audio_track.asin, challenge=license_challenge
             )
             if not license_response:
                 license_response = input(
@@ -471,59 +444,75 @@ class ModuleInterface:
             temp_file_path=final_decrypted_track_location,
         )
 
-    def get_album_info(
-        self, album_id: str, data: dict = {}
-    ) -> Optional[AlbumInfo]:  # Mandatory if ModuleModes.download
-        # raise NotImplementedError
+    def get_album_info(self, album_id: str, data: dict = {}) -> Optional[AlbumInfo]:
         LOGGER.debug("Getting album info")
 
-        try:
-            album_data = dict(
-                data[album_id]
-                if album_id in data
-                else self.mobile_session.get_album_info(album_id)
+        album_data = dict(
+            data[album_id]
+            if album_id in data
+            else self.mobile_session.get_album_info(album_id)
+        )
+        # Force use the ASIN the API returns with
+        album_id = album_data["asin"]
+        search_data = (
+            data[f"{album_id}_search"]
+            if data and f"{album_id}_search" in data
+            else self.mobile_session.search(
+                query=f"{album_data['artist']['name']} - {album_data['title']}",
+                asin=album_id,
+                limit=100,
             )
-            # Force use the ASIN the API returns with
-            album_id = album_data["asin"]
-            search_data = (
-                data[f"{album_id}_search"]
-                if data and f"{album_id}_search" in data
-                else self.mobile_session.search(
-                    query=f"{album_data['artist']['name']} - {album_data['title']}",
-                    asin=album_id,
-                    limit=100,
+        )
+        # import pprint
+        # pprint.pprint(search_data)
+        cover_url = search_data.get("artOriginal", {}).get(
+            "artUrl", album_data.get("image")
+        )
+
+        # Scan through the first 10 tracks (to limit delay if force_album_format)
+        # I think httpx.Client.send is CPU bounded..
+        mapped_tracks = {
+            f"{asin}_quality_mapping": self.mpd_to_quality_map(mpd, asin)
+            for asin, mpd in self.mobile_session.get_tracks_manifest(
+                track["asin"] for track in album_data.get("tracks", [])[:10]
+            )
+            if mpd
+        }
+        best_audio_track = max(
+            [
+                self._get_usable_audio_track_of_mapped_quailty(
+                    mapped_audio_tracks, self.options.quality_tier
                 )
-            )
-            ai = AlbumInfo(
-                name=album_data.get("title", "Unknown"),
-                artist=album_data.get("primaryArtistName", ""),
-                tracks=[track["asin"] for track in album_data.get("tracks", [])],
-                release_year=int(
-                    self._get_date_from_metadata(album_data).strftime("%Y")
-                ),
-                # explicit=False, #TODO iterate over tracks and use any()
-                duration=album_data.get("duration"),
-                artist_id=album_data.get("artist", {}).get("asin"),  # optional
-                # booklet_url="",  # optional
-                cover_url=search_data.get("artOriginal", {}).get(
-                    "artUrl", album_data.get("image")
-                ),  # optional
-                cover_type=ImageFileTypeEnum.jpg,  # optional
-                all_track_cover_jpg_url="",  # technically optional, but HIGHLY recommended
-                animated_cover_url="",  # optional
-                description="",  # optional
-                track_extra_kwargs={
-                    "data": {
-                        track["asin"]: track for track in album_data.get("tracks", [])
-                    }
-                    | {album_id: album_data}
-                    | {f"{album_id}_search": search_data}
-                },  # optional, whatever you want
-            )
-            LOGGER.debug(ai)
-            return ai
-        except Exception as e:
-            LOGGER.error(e, exc_info=True)
+                for mapped_audio_tracks in mapped_tracks.values()
+            ],
+            key=lambda i: i.bitrate,
+        )
+
+        return AlbumInfo(
+            name=search_data.get(
+                "title", "Unknown name"
+            ),  # "".join(str(album_data.get("title", "Unknown")).rsplit("[Explicit]")),
+            artist=album_data.get("primaryArtistName", ""),
+            tracks=[track["asin"] for track in album_data.get("tracks", [])],
+            release_year=int(self._get_date_from_metadata(album_data).strftime("%Y")),
+            # Uncomment if you wish to add [E] (Amazon already returns [Explicit] inside the name)
+            # explicit=any(track["parentalControls"]["hasExplicitLanguage"] for track in album_data.get("tracks", [])),
+            duration=album_data.get("duration"),
+            artist_id=album_data.get("artist", {}).get("asin"),  # optional
+            # booklet_url="",  # optional
+            cover_url=cover_url,  # optional
+            cover_type=ImageFileTypeEnum.jpg,  # optional
+            all_track_cover_jpg_url=cover_url,  # technically optional, but HIGHLY recommended
+            animated_cover_url="",  # optional
+            description="",  # optional
+            quality=f"{best_audio_track.official_quality_name}] [{codec_data[best_audio_track.codec].pretty_name}",
+            track_extra_kwargs={
+                "data": {track["asin"]: track for track in album_data.get("tracks", [])}
+                | {album_id: album_data}
+                | {f"{album_id}_search": search_data}
+                | mapped_tracks
+            },  # optional, whatever you want
+        )
 
     def get_playlist_info(
         self, playlist_id: str, data={}
@@ -850,120 +839,214 @@ class ModuleInterface:
 
         return port
 
-    def _parse_track_mpd(self, mpd: dict[typing.Any, typing.Any], track_asin: str):
+    def _get_usable_audio_track_of_mapped_quailty(
+        self,
+        mapped_audio_tracks: dict[QualityEnum, dict[str, list[AudioTrack]]],
+        quality_tier: QualityEnum,
+    ):
+        track_to_use = None
+        # I tried, ok?
+        # Attempt to find and choose preferred quality (has to be the same returned in the MPD)
+        if max_track_quality_to_use := self.settings["max_track_quality_to_use"]:
+            max_track_quality_to_use = str(max_track_quality_to_use).upper()
+            for (
+                quality_enum,
+                quality_name,
+                tracks,
+            ) in self._iter_over_tracks_to_quality_map(mapped_audio_tracks):
+                if not tracks:
+                    continue
+
+                # Check if the selected MPD quality to use is valid
+                if max_track_quality_to_use not in quality_name:
+                    continue
+
+                self.print(
+                    f"Downloading in {quality_name} as it is matched with {max_track_quality_to_use}."
+                )
+
+                for track in tracks:
+                    if not (track.quality.startswith(max_track_quality_to_use)):
+                        continue
+                    track_to_use = track
+                    break
+                else:
+                    continue
+                break
+
+            if not track_to_use:
+                self.print(
+                    f"{module_information.service_name}: Failed to find {max_track_quality_to_use!r}, defaulting to highest avaliable."
+                )
+
+        # If max_track_quality_to_use is not set or failed, then use the global quality to use
+        if not track_to_use:
+            for (
+                quality_enum,
+                quality_name,
+                tracks,
+            ) in self._iter_over_tracks_to_quality_map(mapped_audio_tracks):
+                # self.print(f"{quality_enum=}, {quality_name=}, {tracks=}")
+                if not tracks:
+                    continue
+
+                if len(tracks) > 1:
+                    LOGGER.warning(
+                        f"There are more than one tracks avaliable for {quality_name}. "
+                        f"Avaliable qualities: "
+                        ", ".join(
+                            f"{item.quality} with ranking {item.quality_ranking}"
+                            for item in tracks
+                        )
+                    )
+                if quality_enum.value <= quality_tier.value:
+                    track_to_use = tracks[0]
+                    break
+
+                continue
+
+        if not isinstance(track_to_use, AudioTrack):
+            raise TypeError(f"{track_to_use=}, type: {type(track_to_use)}")
+
+        LOGGER.debug(f"Using AudioTrack: {track_to_use}")
+        return track_to_use
+
+    def mpd_to_quality_map(self, mpd: ElementTree.Element, track_asin: str):
+        """
+        A helper function to retrieve a mapping of a QualityEnum
+        to a dictionary of a Quality and a list of AudioTracks via a MPD.
+
+        """
+        # LOGGER.debug(json.dumps(mpd, indent=3))
+        avaliable_tracks = self._mpd_to_audio_track(mpd, track_asin)
+
+        # Sorting by bitrate helps retrieve the highest resolution avaliable
+        LOGGER.debug(avaliable_tracks)
+
+        preferred_codecs = [CodecEnum.OPUS, CodecEnum.FLAC]
+
+        if not self.settings["force_non_spatial"]:
+            if self.settings["prefer_spatial_mha1"]:
+                preferred_codecs.append(CodecEnum.MHA1)
+            else:
+                preferred_codecs.append(CodecEnum.MHM1)
+
+            if self.settings["prefer_spatial_ac4"]:
+                preferred_codecs.append(CodecEnum.AC4)
+            else:
+                preferred_codecs.append(CodecEnum.EAC3)
+        mapped_audio_tracks = self.tracks_to_quality_map(
+            avaliable_tracks, preferred_codecs
+        )
+        LOGGER.debug(mapped_audio_tracks)
+        return mapped_audio_tracks
+
+    def _mpd_to_audio_track(self, manifest: ElementTree.Element, track_asin: str):
         """
         Iterate over the manifest to grab the tracks and append them to avaliable_tracks as a AudioTrack object
 
 
         (which is a xml file that follows the urn:mpeg:dash:profile:isoff-on-demand:2011 profile)
         """
-        manifest = dict(mpd["MPD"]["Period"])
+
+        # manifest = dict(mpd["MPD"]["Period"])
         avaliable_tracks: list[AudioTrack] = []
-        # for period in manifest.findall("Period"):
-        # for period in manifest.get("Period"):
-        for adaptation_set in manifest.get("AdaptationSet", []):
-            adaptation_set: list[dict[typing.Any, typing.Any]]
-            # LOGGER.debug(json.dumps(adaptation_set, indent=3))
-            content_type = adaptation_set.get("@contentType")
-            if content_type != "audio":
-                raise ValueError("Only supports audio MPDs!")
 
-            key_id = None
-            pssh = None
+        for period in manifest.findall("Period"):
+            for adaptation_set in period.findall("AdaptationSet"):
+                content_type = adaptation_set.get("contentType")
+                if content_type != "audio":
+                    raise ValueError("Only supports audio MPDs!")
 
-            for content_property in adaptation_set.get("ContentProtection"):
-                # print(content_property)
-                if (
-                    content_property.get("@schemeIdUri")
-                    == "urn:mpeg:dash:mp4protection:2011"
-                ):
-                    key_id = str(content_property.get("@cenc:default_KID"))
-                    continue
+                pssh = None
 
-                # NOTE might need to use xmltodict instead of xml.etree.ElementTree
-                if (
-                    content_property.get("@schemeIdUri")
-                    == "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
-                ):
-                    LOGGER.debug(f"Chosen: {adaptation_set}")
-                    pssh = PSSH(content_property.get("cenc:pssh"), strict=True)
-                    # print(f"{pssh=}")
+                for content_property in adaptation_set.findall("ContentProtection"):
+                    if (
+                        content_property.get("schemeIdUri")
+                        != "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+                    ):
+                        continue
+
+                    pssh_elem = content_property.find("{urn:mpeg:cenc:2013}pssh")
+
+                    if not (pssh_elem is not None and pssh_elem.text):
+                        continue
+                    pssh = PSSH(pssh_elem.text, strict=True)
                     break
 
-            if not (key_id and pssh):
-                print("failed")
-                raise ValueError("No key id or PSSH found!")
+                else:
+                    raise ValueError("Failed to find PSSH.")
 
-            # unused, can be used for album.quality but can't move
-            # codec_data[codec].spatial
-            supplemental_property = adaptation_set.get("SupplementalProperty")
-            supprop = (
-                supplemental_property
-                if isinstance(supplemental_property, list)
-                else [supplemental_property]
-            )
-            official_quality_name = [
-                item.get("@value")
-                for item in supprop
-                if item.get("@schemeIdUri") == "amz-music:trackType"
-            ][0]
-            LOGGER.debug(f"Official name for track: {official_quality_name}")
-
-            # print(adaptation_set)
-            representations = (
-                [adaptation_set.get("Representation")]
-                if isinstance(adaptation_set.get("Representation"), dict)
-                else list(adaptation_set.get("Representation"))
-            )
-            for representation in representations:
-                # LOGGER.debug(f"{representation=}")
-                media_url = str(representation.get("BaseURL"))
-
-                muq = iter(re.split("=|&", urlparse(media_url).query))
-                media_url_query = dict(zip(muq, muq))
-                LOGGER.debug(media_url_query)
-                quality = str(media_url_query.get("ql"))
-
-                codec = str(representation.get("@codecs")).upper()
-                # 360 Audio
-                if codec.startswith("MHA1"):
-                    codec = "MHA1"
-                elif codec.startswith("MHM1"):
-                    codec = "MHM1"
-                # Dolby Atmos
-                elif codec.startswith("EC-3"):
-                    codec = "EAC3"
-                elif codec.startswith("AC-4"):
-                    codec = "AC4"
-
-                codec = CodecEnum[codec]
-                # LOGGER.debug(codec)
-                # print(representation)
-
-                avaliable_tracks.append(
-                    AudioTrack(
-                        asin=track_asin,
-                        codec=codec,
-                        bit_depth=int(
-                            representation.get("SupplementalProperty", {}).get(
-                                "@value", 0
-                            )
-                        )
-                        if not (
-                            codec_data[codec].spatial and codec_data[codec].proprietary
-                        )
-                        else None,
-                        bitrate=int(
-                            representation.get("@bandwidth") or 0
-                        ),  # bandwidth is a period; cps. multiply by 2
-                        sample_rate=int(representation.get("@audioSamplingRate") or 0),
-                        # url=representation.find("BaseURL").text,
-                        url=media_url,
-                        quality_ranking=int(representation.get("@qualityRanking")),
-                        quality=quality,
-                        pssh=pssh,
+                supplemental_properties = adaptation_set.findall("SupplementalProperty")
+                for prop in supplemental_properties:
+                    if prop.get("schemeIdUri") != "amz-music:trackType":
+                        continue
+                    official_quality_name = prop.get("value", "Unknown")
+                    LOGGER.debug(f"Official name for track: {official_quality_name}")
+                    break
+                else:
+                    # impossible unless amazon changes their backend (never)
+                    raise RuntimeError(
+                        [item.attrib for item in supplemental_properties]
                     )
-                )
+
+                for representation in adaptation_set.findall("Representation"):
+                    media_url_elem = representation.find("BaseURL")
+                    if not (media_url_elem is not None and media_url_elem.text):
+                        raise IndexError(f"Failed to find Media URL for {track_asin}")
+                    media_url = media_url_elem.text
+
+                    muq = iter(re.split("=|&", urlparse(media_url).query))
+                    media_url_query = dict(zip(muq, muq))
+                    quality = str(media_url_query.get("ql"))
+
+                    if quality.startswith(
+                        "UHD"
+                    ) and not official_quality_name.startswith("UHD"):
+                        # amz-music:trackType only returns the following:
+                        # LD, SD, HD, and 3D
+                        official_quality_name = "UHD"
+
+                    codec = str(representation.get("codecs")).upper()
+                    # 360 Audio
+                    if codec.startswith("MHA1"):
+                        codec = "MHA1"
+                    elif codec.startswith("MHM1"):
+                        codec = "MHM1"
+                    # Dolby Atmos
+                    elif codec.startswith("EC-3"):
+                        codec = "EAC3"
+                    elif codec.startswith("AC-4"):
+                        codec = "AC4"
+
+                    codec = CodecEnum[codec]
+
+                    bit_depth = None
+                    if codec is CodecEnum.FLAC:
+                        sp = representation.find("SupplementalProperty")
+                        if sp is not None:
+                            bit_depth = int(sp.get("value", 0))
+
+                    avaliable_tracks.append(
+                        AudioTrack(
+                            asin=track_asin,
+                            codec=codec,
+                            bit_depth=bit_depth,
+                            bitrate=int(
+                                int(representation.get("bandwidth") or 0) / 1000
+                            ),  # im not exactly sure why i have to divide it by 1000 but meh
+                            sample_rate=int(
+                                representation.get("audioSamplingRate") or 0
+                            ),
+                            url=media_url,
+                            official_quality_name=official_quality_name,
+                            quality_ranking=int(
+                                representation.get("qualityRanking", 0)
+                            ),
+                            quality=quality,
+                            pssh=pssh,
+                        )
+                    )
 
         if not avaliable_tracks:
             raise ValueError("No tracks found!")
@@ -971,6 +1054,8 @@ class ModuleInterface:
         avaliable_tracks = natsort.natsorted(
             avaliable_tracks, key=lambda x: x.quality, reverse=False
         )
+        # import pprint
+        # pprint.pprint(avaliable_tracks)
         return avaliable_tracks
 
     @staticmethod
@@ -991,7 +1076,7 @@ class ModuleInterface:
         Example output:
 
         {
-            QualityEnum.HIFI: {
+            "hifi": {
                 "SPATIAL_ATMOS_HIGH": [
                     AudioTrack(),
                 ],
@@ -1029,17 +1114,17 @@ class ModuleInterface:
 
             # AudioTracks are sorted best quality to worse
 
-            sorted_tracks = natsort.natsorted(
-                [item for item in tracks if key_for_filtering_audiotracks(item)],
-                key=key_for_sorting_avaliable_tracks,
-                reverse=True,
-            )
             grouped_tracks = {
-                key: list(group)
+                key: natsort.natsorted(
+                    group, key=key_for_sorting_avaliable_tracks, reverse=True
+                )
                 for key, group in itertools.groupby(
-                    sorted_tracks, key=key_for_grouping_audiotracks
+                    [item for item in tracks if key_for_filtering_audiotracks(item)],
+                    key=key_for_grouping_audiotracks,
                 )
             }
+            # import pprint
+            # pprint.pprint(grouped_tracks)
 
             quality_to_track_mapping.update({quality_enum: grouped_tracks})
 
