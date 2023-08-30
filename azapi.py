@@ -241,13 +241,12 @@ class AmazonMusicMobileAPI:
     def _wait_for_response(session: httpx.Client, request: httpx.Request):
         # Sometimes we get a DNS resolve error (too many requests for manifest?), this attempts to retry 5 times
         attempt = 0
+        resp = None
         while attempt <= 5:
             attempt += 1
             try:
                 LOGGER.debug("Handling request: %s", request)
                 resp = session.send(request)
-                if resp.text:
-                    LOGGER.debug(resp.text)
                 resp.raise_for_status()
             except httpx.HTTPError as ce:
                 time.sleep(10)
@@ -257,7 +256,10 @@ class AmazonMusicMobileAPI:
             else:
                 # return the response when successful
                 return resp
-        raise
+        else:
+            if not resp:
+                return
+            LOGGER.error(resp.text)
 
     def post(
         self,
@@ -324,7 +326,9 @@ class AmazonMusicMobileAPI:
 
     @functools.lru_cache()
     def get_metadata(
-        self, asins: str | typing.Sequence[str]
+        self,
+        asins: str | typing.Sequence[str],
+        music_territory: typing.Optional[str] = None,
     ) -> dict[str, list[dict[str, typing.Any]]]:
         """
         Get metadata for a track, album, playlist or artist.
@@ -341,11 +345,13 @@ class AmazonMusicMobileAPI:
         hasLyrics, ownership, expandTracklist, includeVideo, requestAudioVideo, popularity, albumArtist, collectionLibraryAvailability,
         includePurchaseDetails, editorialAssociations]
         """
-        # TODO figure out how to get avaliable qualities through this api (see mobile and web requests to get what i mean)
-        # Valid keywords to Amazon JP (unknown)
+        # Valid keywords to Amazon JP (for playlist metadata, diff endpoint)
         # objectId,fileName,fileExtension,fileSize,creationDate,lastUpdatedDate,orderId,asin,purchaseDate,localFilePath,md5,status,purchased,uploaded,title,sortTitle,rating,marketplace,physicalOrderId,assetType,artistName,artistAsin,contributors,trackNum,discNum,primaryGenre,duration,bitrate,composer,songWriter,performer,lyricist,publisher,errorCode,instantImport,primeStatus,isMusicSubscription,albumName,albumAsin,albumArtistName,albumArtistAsin,albumContributors,albumRating,albumPrimaryGenre,albumReleaseDate,sortArtistName,sortAlbumName,sortAlbumArtistName,audioUpgradeDate,parentalControls,assetEligibility,eligibility,internalTags
         if not asins:
             raise ValueError(asins)
+        if not music_territory:
+            music_territory = self.credentials.web_client_config.music_territory
+
         asins = [asins] if isinstance(asins, str) else list(asins)
         response = self.post(
             url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/muse/",
@@ -378,14 +384,15 @@ class AmazonMusicMobileAPI:
                     "playlistLibraryAvailability",
                 ],
                 "filters": None,
-                "lang": "en_US",
+                "lang": self.credentials.web_client_config.locale,  # the lang locale of the phone/mobile app, en_US
                 "marketplaceId": None,
-                "metadataLang": None,  # null for locale based on IP
+                "metadataLang": None,  # null for locale based on IP, setting to a random string value returns it romanized
                 "musicRequestIdentityContextToken": None,
-                "musicTerritory": self.credentials.web_client_config.music_territory,
+                "musicTerritory": music_territory,
                 "requestedContent": "ALL_STREAMABLE",  # FULL_CATALOG is valid too
                 "sessionId": None,
                 "stub": None,
+                # "debug": True
             },
         )
         if response.status_code != 200:
@@ -393,6 +400,7 @@ class AmazonMusicMobileAPI:
                 f"Failed to get track manifest: {response.status_code} {response.text}"
             )
         resp_json = response.json()
+
         LOGGER.debug(json.dumps(resp_json, indent=2))
         return resp_json
 
@@ -404,6 +412,7 @@ class AmazonMusicMobileAPI:
         search_types: typing.Optional[tuple[str, ...]] = None,
         limit: typing.Optional[int] = 50,
         locale: typing.Optional[str] = None,
+        music_territory: typing.Optional[str] = None,
     ) -> dict[typing.Any, typing.Any]:
         ...
 
@@ -415,6 +424,7 @@ class AmazonMusicMobileAPI:
         search_types: typing.Optional[tuple[str, ...]] = None,
         limit: typing.Optional[int] = 50,
         locale: typing.Optional[str] = None,
+        music_territory: typing.Optional[str] = None,
     ) -> typing.Generator[dict[typing.Any, typing.Any], None, None]:
         ...
 
@@ -444,6 +454,7 @@ class AmazonMusicMobileAPI:
         search_types: typing.Optional[tuple[str, ...]] = None,
         limit: typing.Optional[int] = 50,
         locale: typing.Optional[str] = None,
+        music_territory: typing.Optional[str] = None,
     ):
         url = f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/textsearch/search/v1_1/"
         headers = {
@@ -454,7 +465,9 @@ class AmazonMusicMobileAPI:
         if search_types is None:
             search_types = ("catalog_album",)
         if not locale:
-            locale = "en_US"
+            locale = self.credentials.web_client_config.locale
+        if not music_territory:
+            music_territory = self.credentials.web_client_config.music_territory
 
         result_specs = [
             {
@@ -472,7 +485,6 @@ class AmazonMusicMobileAPI:
                             "contentTier",
                             "artOriginal",
                             "contentEncoding",
-                            "fileExtension",
                         ],
                         "filters": None,
                         "type": label_type,
@@ -501,11 +513,11 @@ class AmazonMusicMobileAPI:
                     "allowCorrection": True,
                     "rejected": None,
                 },
-                "spiritual": None,
+                "spiritual": None,  # a boolean, unknown purpose
                 "upsell": {"allowUpsellForCatalogContent": False},
             },
             "locale": locale,
-            "musicTerritory": self.credentials.web_client_config.music_territory,
+            "musicTerritory": music_territory,
             "query": query,
             "queryMetadata": None,
             "resultSpecs": result_specs,
@@ -513,6 +525,7 @@ class AmazonMusicMobileAPI:
 
         response = self.post(url=url, headers=headers, data=data)
         resp_json = response.json()
+
         LOGGER.debug(resp_json)
 
         results = resp_json.get("results", {})
@@ -521,13 +534,87 @@ class AmazonMusicMobileAPI:
 
         if not asins:
             return self.get_documents_from_search_results(results)
-        
+
         for asin in asins:
             if result := self.find_item_by_asin_in_search_results(results, asin):
                 return result
         else:
             return
 
+    def get_page(
+        self,
+        uri: str,
+        count: typing.Optional[int] = None,
+        locale: typing.Optional[str] = None,
+    ):
+        """
+        Get a page of a Amazon Music URI.
+
+        Args:
+            uri: str: A valid Amazon Music URI.
+            count: int: How many related albums you want to obtain?
+            I have no idea what the `count` paramter means.
+
+        Example usage:
+
+        `self.mobile_session.get_page("album/B0CDJC65LH", count=0, locale="en_US")
+        """
+        if not locale:
+            locale = self.credentials.web_client_config.locale
+        if not count:
+            count = 5
+        # Content features can be any of the following:
+        # 'contentFeatures' failed to satisfy constraint: Member must satisfy constraint: [Member must satisfy enum value set: [requestFeaturedPlayV4Sub1, podcastSonicRush, pinPodcastsInFacetedNavigation, requestFeaturedPlayV6NoPodcasts, includeFacetedNavigation, personalizedPlaylist, includeVideoStory, includePodcastCuratedContent, podcast, includePodcastExploreBites, populateRecentlyPlayed, includeLiveEvent, includeVideoStoryOnArtistHighlights, allowDeepLinkURLInWidget, includeAlbumDetailUpsellWidgets, requestFeaturedPlayV2, requestFeaturedPlayV3, bundesliga, artistTasteCollection, requestFeaturedPlayV4, includePodcastBitesVisualShoveler, requestFeaturedPlayV5, includeVideoShow, includeCommentary, requestFeaturedPlayV6, requestFeaturedPlay, includePodcastUserContent, includeVideo, audioShow, includeLiveStream, includeFollowArtistsWidget, includeMerch, includeStationFromAnything, editorialAssociations, includeUpsellWidgets, includeAmpShows, recentlyPlayed, allowVerticalItemBarkers, includeCommentaryFlag, includePodcastEpisodeDescriptiveShoveler]]
+
+        resp = self.post(
+            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/musepage/",
+            headers={
+                "x-amz-target": "com.amazon.musicensembleservice.MusicEnsembleService.page",
+                "User-Agent": self.APP_USER_AGENT,
+                "X-Amz-Requestid": str(uuid.uuid4()).lower(),
+            },
+            data={
+                "allowedParentalControls": {"hasExplicitLanguage": True},
+                "allowedParentalControlsString": None,
+                "artistVideoStoryEntityAsin": None,
+                "browseId": None,
+                "campaignsXml": None,
+                "contentFeatures": [
+                    "includeVideo",
+                    "includeVideoStory",
+                    "allowDeepLinkURLInWidget",
+                    "podcast",
+                    "includePodcastCuratedContent",
+                    "includePodcastUserContent",
+                    "includePodcastEpisodeDescriptiveShoveler",
+                    "podcastSonicRush",
+                    "includeLiveStream",
+                ],
+                "count": count,
+                "countOfEntitiesPerWidget": None,
+                "customerIP": None,
+                "customerId": None,
+                "debug": None,  # set for True for.. a new errors attribute.
+                "deviceId": self.credentials.device_info["device_serial_number"],
+                "deviceType": AmazonMobileApplication.MUSIC.device_type,
+                "ipAddress": None,
+                "languagesOfPerformance": None,
+                "locale": locale,  # "ja_JP"
+                "marketplaceId": None,
+                "musicRequestIdentityContextToken": None,
+                "musicTerritory": self.credentials.web_client_config.music_territory,
+                "nextToken": None,
+                "offset": None,
+                "requestedContent": "KATANA",
+                "sessionId": None,
+                "stub": False,
+                "testTraffic": None,
+                "upsellContent": None,
+                "uri": uri,  # e.g "album/B0CDJC65LH"
+                "validationPayload": None,
+            },
+        )
+        return dict(resp.json())
 
     def get_recent_tracks(self):
         """
@@ -751,24 +838,28 @@ class AmazonMusicMobileAPI:
     # Shortcuts
 
     def get_track_manifest(self, track_asin: str):
-        for asin, mpd in self.parse_from_content_responses(
-            self._get_tracks_manifest((track_asin,))
-        ):
-            return asin, mpd
-        else:
-            # for unpacking
-            return None, None
+        return next(
+            self.parse_from_content_responses(self._get_tracks_manifest((track_asin,))),
+            (None, None),
+        )
 
     def get_track_info(self, track_asin: str):
         resp = self.get_metadata(track_asin)["trackList"]
-        if len(resp) > 1:
-            raise Exception("Failed to get track manifest: tracklist is greater than 1")
+        if len(resp) > 1 or not resp:
+            raise ValueError(f"Failed to get track metadata. {resp}")
         return resp[0]
 
     def get_album_info(self, album_asin: str):
         resp = self.get_metadata(album_asin)["albumList"]
-        if len(resp) > 1:
-            raise Exception("Failed to get track manifest: albumList is greater than 1")
+        if len(resp) > 1 or not resp:
+            raise ValueError(f"Failed to get album metadata. {resp}")
+
+        return resp[0]
+
+    def get_artist_info(self, artist_asin: str):
+        resp = self.get_metadata(artist_asin)["artistList"]
+        if len(resp) > 1 or not resp:
+            raise ValueError(f"Failed to get artist metadata. {resp}")
         return resp[0]
 
     def get_artist_page(self, asin: str):
@@ -819,12 +910,12 @@ class AmazonMusicMobileAPI:
         Comedically long function name
         """
         for document in self.get_documents_from_search_results(results):
-            asins = [
+            avaliable_asins = [
                 str(document.get(item))
                 for item in ("albumAsin", "artistAsin", "asin")
                 if document.get(item)
             ]
-            if asin not in asins:
+            if asin not in avaliable_asins:
                 continue
             return document
         return

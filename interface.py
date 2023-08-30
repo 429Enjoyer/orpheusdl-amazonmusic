@@ -225,36 +225,23 @@ class ModuleInterface:
                 else self.mobile_session.get_album_info(album_id)
             )
             album_id = str(album_data["asin"])
-            
+
+            # NOTE: I *could* use catalog_track AND catalog album
+            # but I prefer to limit the amount of API Requests per track
             search_data = (
                 data[f"{album_id}_search"]
                 if data and f"{album_id}_search" in data
                 else self.mobile_session.search(
-                    query='{}, "{}" - "{}"'.format(
+                    query='"{}", "{}"'.format(
                         album_data["artist"]["name"],
                         album_data["title"],
-                        track_data["title"],
+                        # track_data["title"],
                     ),
-                    asins=(album_id, track_id, str(track_data['globalAsin'])),
-                    search_types=("catalog_track", "catalog_album"),
+                    asins=(album_id, track_id, str(track_data["globalAsin"])),
+                    search_types=("catalog_album",),
                 )
                 or {}
             )
-            # import pprint
-            # pprint.pprint(search_data)
-
-            contributors: list[str] = []
-            # NOTE the main artist is inside contributors only if the album as one or more contributors
-            if contributor_asins := tuple(track_data["artist"]["contributorAsins"]):
-                contributors.extend(
-                    str(item["name"])
-                    for item in self.mobile_session.get_metadata(
-                        contributor_asins
-                    )["artistList"]
-                )
-            else:
-                # Fallback, include the main artist only
-                contributors.append(album_data["artist"]["name"])
 
             release_datetime = self._get_date_from_metadata(album_data)
             mapped_audio_tracks = (
@@ -276,11 +263,33 @@ class ModuleInterface:
                 to_print=True,
             )
 
+            contributors: list[str] = []
+            # NOTE the main artist is inside contributors only if the album as one or more contributors
+            if contributor_asins := tuple(track_data["artist"]["contributorAsins"]):
+                contributors.extend(
+                    str(item["name"])
+                    for item in self.mobile_session.get_metadata(contributor_asins)[
+                        "artistList"
+                    ]
+                )
+            else:
+                # Fallback, include the main artist only
+                contributors.append(album_data["artist"]["name"])
+
             # Calculate the total disc avaliable by iterating each track and using the highest value
             disc_total = max(int(t["discNum"]) for t in album_data.get("tracks", [{}]))
-            composers = natsort.natsorted(
-                set(track_data.get("songWriters", []) + contributors)
-            )
+            writers = list(track_data.get("songWriters", []))
+
+            # Sometimes writers are just one item in a list, seperated with /
+            # e.g https://music.amazon.co.jp/albums/B0CG7FWYTK
+            if any(" / " in item for item in writers):
+                for item in writers:
+                    if " / " not in item:
+                        continue
+                    writers.extend(str(item).split(" / "))
+                    writers.remove(item)
+
+            composers = natsort.natsorted(set(writers + contributors))
 
             composers = "; ".join(composers)
 
@@ -305,7 +314,9 @@ class ModuleInterface:
             genres = [
                 # sanitize and format the genre name from search data
                 # this genre tends to be more specific
-                " ".join(re.split("_| ", str(search_data.get("primaryGenre", "")))).title()
+                " ".join(
+                    re.split("_| ", str(search_data.get("primaryGenre", "")))
+                ).title()
             ]
             if album_data["productDetails"]["primaryGenreName"] not in genres:
                 # this genre name tends to be broad
@@ -458,17 +469,16 @@ class ModuleInterface:
         )
         # Force use the ASIN the API returns with
         album_id = album_data["asin"]
-        search_data = (
+        search_data = dict(
             data[f"{album_id}_search"]
             if data and f"{album_id}_search" in data
             else self.mobile_session.search(
                 query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
-                asins=(album_id, album_data['requestedAsin']),
+                asins=(album_id, album_data["requestedAsin"]),
                 limit=100,
             )
         )
-        # import pprint
-        # pprint.pprint(search_data)
+
         cover_url = search_data.get("artOriginal", {}).get(
             "artUrl", album_data.get("image")
         )
@@ -493,7 +503,7 @@ class ModuleInterface:
         )
 
         return AlbumInfo(
-            name=search_data.get(
+            name=album_data.get(
                 "title", "Unknown name"
             ),  # "".join(str(album_data.get("title", "Unknown")).rsplit("[Explicit]")),
             artist=album_data.get("primaryArtistName", ""),
@@ -557,24 +567,38 @@ class ModuleInterface:
             artist_id = str(artist_data["asin"])
             artist_name = str(artist_data["name"])
 
-        albums = []
+        albums: list[dict[str, typing.Any]] = []
+        albums_metadata: list[dict[str, typing.Any]] = []
 
+        self.print(
+            f"{module_information.service_name}: Loading albums for {artist_data['name']}, this may take a while.."
+        )
         for album in self.mobile_session.search(
             query=f'"{artist_name}"',
-            search_types=tuple(["catalog_album"]),
+            search_types=("catalog_album",),
             limit=1000,
         ):
             if artist_name not in album.get("artistName", ""):
                 continue
+            album_metadata = self.mobile_session.get_album_info(album["asin"])
+            # Filter out foreign albums with the same artist name (but not ID)
+            if (
+                not album_metadata["artist"]["contributorAsins"]
+                and album_metadata["artist"]["asin"] != artist_id
+            ):
+                continue
+
             # Assume that if they aren't equal, they are credited albums
             # artist_id != album.get("artistAsin")
-            if artist_name != album.get("artistName", "") and not get_credited_albums:
+            if (artist_name != album.get("artistName", "")) and not get_credited_albums:
                 continue
-                        
+
+            albums_metadata.append(album_metadata)
             albums.append(album)
 
         if not albums:
-            return ArtistInfo(name=artist_name)
+            self.print(f"No albums found for {artist_name} with ID: {artist_id}.")
+            return ArtistInfo(artist_name)
 
         return ArtistInfo(
             name=artist_name,
@@ -582,6 +606,10 @@ class ModuleInterface:
             album_extra_kwargs={
                 "data": {
                     f"{album_data['asin']}_search": album_data for album_data in albums
+                }
+                | {
+                    str(album_meta["asin"]): album_meta
+                    for album_meta in albums_metadata
                 }
             },
             # tracks=[],
@@ -847,7 +875,7 @@ class ModuleInterface:
         self,
         mapped_audio_tracks: dict[QualityEnum, dict[str, list[AudioTrack]]],
         quality_tier: QualityEnum,
-        to_print: typing.Optional[bool] = False
+        to_print: typing.Optional[bool] = False,
     ):
         track_to_use = None
         # I tried, ok?
