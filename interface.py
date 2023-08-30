@@ -892,16 +892,17 @@ class ModuleInterface:
         quality_tier: QualityEnum,
         to_print: typing.Optional[bool] = False,
     ):
-        track_to_use = None
+        track_to_use: AudioTrack | None = None
         # I tried, ok?
         # Attempt to find and choose preferred quality (has to be the same returned in the MPD)
+        mapped_qual_tracks = list(self._iter_over_tracks_to_quality_map(mapped_audio_tracks))
         if max_track_quality_to_use := self.settings["max_track_quality_to_use"]:
             max_track_quality_to_use = str(max_track_quality_to_use).upper()
             for (
                 quality_enum,
                 quality_name,
                 tracks,
-            ) in self._iter_over_tracks_to_quality_map(mapped_audio_tracks):
+            ) in mapped_qual_tracks:
                 if not tracks:
                     continue
 
@@ -928,13 +929,19 @@ class ModuleInterface:
                     f"{module_information.service_name}: Failed to find {max_track_quality_to_use!r}, defaulting to highest avaliable."
                 )
 
+        # Handle 360RA files seperately because Amazon ranks 360RA differently
+        if not track_to_use:
+            if item := list(i for i in mapped_qual_tracks if "RA360" in i[1]):
+                # Get the last item (max quality) list of tuple and get the first item inside tracks
+                track_to_use = item[-1][-1][0]
+
         # If max_track_quality_to_use is not set or failed, then use the global quality to use
         if not track_to_use:
             for (
                 quality_enum,
                 quality_name,
                 tracks,
-            ) in self._iter_over_tracks_to_quality_map(mapped_audio_tracks):
+            ) in mapped_qual_tracks:
                 # self.print(f"{quality_enum=}, {quality_name=}, {tracks=}")
                 if not tracks:
                     continue
@@ -948,6 +955,7 @@ class ModuleInterface:
                             for item in tracks
                         )
                     )
+
                 if quality_enum.value <= quality_tier.value:
                     track_to_use = tracks[0]
                     break
@@ -1141,9 +1149,10 @@ class ModuleInterface:
         for quality_enum, qualities in reversed(self.quality_parse.items()):
 
             def key_for_sorting_avaliable_tracks(track: AudioTrack):
-                if "ATMOS" in track.quality:
-                    return track.bitrate
-                if "LD" in track.quality:
+                if any(
+                    item in track.quality
+                    for item in ("ATMOS", "LD", "RA360")
+                ):
                     return track.bitrate
                 if quality_enum.value <= QualityEnum.LOSSLESS.value:
                     return track.quality_ranking
@@ -1155,8 +1164,8 @@ class ModuleInterface:
                         and track.codec in preferred_codecs
                     ):
                         continue
-                    return True
-                return False
+                    return quality
+                return
 
             def key_for_grouping_audiotracks(track: AudioTrack):
                 return track.quality
@@ -1172,8 +1181,6 @@ class ModuleInterface:
                     key=key_for_grouping_audiotracks,
                 )
             }
-            # import pprint
-            # pprint.pprint(grouped_tracks)
 
             quality_to_track_mapping.update({quality_enum: grouped_tracks})
 
