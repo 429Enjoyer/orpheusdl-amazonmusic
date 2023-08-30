@@ -263,10 +263,10 @@ class ModuleInterface:
                 to_print=True,
             )
 
-            contributors: list[str] = []
+            artists: list[str] = []
             # NOTE the main artist is inside contributors only if the album as one or more contributors
             if contributor_asins := tuple(track_data["artist"]["contributorAsins"]):
-                contributors.extend(
+                artists.extend(
                     str(item["name"])
                     for item in self.mobile_session.get_metadata(contributor_asins)[
                         "artistList"
@@ -274,20 +274,26 @@ class ModuleInterface:
                 )
             else:
                 # Fallback, include the formatted artist name (might include contributors)
-                contributors.append(album_data["artist"]["name"])
+                artists.append(track_data["artist"]["name"])
             
             # Attempt to seperate each contributor if they're concatenated
-            for contributor in contributors.copy():
-                contributor_sep = {
+            for artist in artists.copy():
+                artist_sep = {
                     item
-                    for item in re.split(r", | & ", contributor)
+                    for item in re.split(r", | & ", artist)
                     if item
                 }
-                if contributor_sep:
-                    contributors.extend(
-                        contributor_sep
-                    )
-                    contributors.remove(contributor)
+                if not artist_sep:
+                    continue
+                artists.extend(
+                    artist_sep
+                )
+                artists.remove(artist)
+            
+            # Prefer to have the primary artist name at the start
+            if album_data["primaryArtistName"] and album_data["primaryArtistName"] in artists:
+                artists.remove(album_data["primaryArtistName"])
+                artists.insert(0, album_data["primaryArtistName"])
 
             # Calculate the total disc avaliable by iterating each track and using the highest value
             disc_total = max(int(t["discNum"]) for t in album_data.get("tracks", [{}]))
@@ -369,7 +375,7 @@ class ModuleInterface:
                 name=track_data["title"],
                 album_id=album_id,
                 album=track_data["album"]["title"],
-                artists=contributors,
+                artists=artists,
                 tags=tags,
                 codec=track_to_use.codec,
                 cover_url=artwork_url,  # make sure to check module_controller.orpheus_options.default_cover_options
