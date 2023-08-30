@@ -273,8 +273,21 @@ class ModuleInterface:
                     ]
                 )
             else:
-                # Fallback, include the main artist only
+                # Fallback, include the formatted artist name (might include contributors)
                 contributors.append(album_data["artist"]["name"])
+            
+            # Attempt to seperate each contributor if they're concatenated
+            for contributor in contributors.copy():
+                contributor_sep = {
+                    item
+                    for item in re.split(r", | & ", contributor)
+                    if item
+                }
+                if contributor_sep:
+                    contributors.extend(
+                        contributor_sep
+                    )
+                    contributors.remove(contributor)
 
             # Calculate the total disc avaliable by iterating each track and using the highest value
             disc_total = max(int(t["discNum"]) for t in album_data.get("tracks", [{}]))
@@ -289,7 +302,7 @@ class ModuleInterface:
                     writers.extend(str(item).split(" / "))
                     writers.remove(item)
 
-            composers = natsort.natsorted(set(writers + contributors))
+            composers = natsort.natsorted(set(writers))
 
             composers = "; ".join(composers)
 
@@ -313,7 +326,9 @@ class ModuleInterface:
                 )
             genres = [
                 # sanitize and format the genre name from search data
-                # this genre tends to be more specific
+                # this genre tends to be more specific however,
+                # it may not be always avaliable
+                # e.g https://music.amazon.co.jp/albums/B09JNRPVHN?trackAsin=B09JNRQQ3P
                 " ".join(
                     re.split("_| ", str(search_data.get("primaryGenre", "")))
                 ).title()
