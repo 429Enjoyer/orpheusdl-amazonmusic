@@ -139,14 +139,25 @@ class ModuleInterface:
         if self.mobile_session.credentials.access_token_expired:
             self.mobile_session.refresh_access_token()
 
-        module_controller.temporary_settings_controller.set(
-            "credentials", self.mobile_session.credentials.to_dict()
-        )
+        if credentials != self.mobile_session.credentials:
+            module_controller.temporary_settings_controller.set(
+                "credentials", self.mobile_session.credentials.to_dict()
+            )
         LOGGER.debug(self.mobile_session.credentials)
 
     def login_onto_mobile(
         self, email: str, password: str
     ):  # Called automatically by Orpheus when standard_login is flagged, otherwise optional
+        if not (self.settings["country_tld"] and self.settings["country"]):
+            raise ValueError(
+                "Please fill in country_tld and country before trying to login!"
+            )
+        self.print(
+            (
+                f"{module_information.service_name}: Logging on using "
+                f"{self.settings['country_tld']} as the TLD and {self.settings['country']} as the region."
+            )
+        )
         mobile_session = AmazonMusicMobileAPI.login_via_mobile(
             email, password, self.settings["country_tld"], self.settings["country"]
         )
@@ -249,8 +260,15 @@ class ModuleInterface:
                 if data and f"{track_id}_quality_mapping" in data
                 else None
             )
+
             if not mapped_audio_tracks:
-                asin, mpd = self.mobile_session.get_track_manifest(track_id)
+                asin, mpd = self.mobile_session.get_track_manifest(
+                    track_asin=track_id,
+                    force_3d=any(
+                        not self.settings["force_non_spatial"] or self.settings[key]
+                        for key in ("prefer_spatial_mha1", "prefer_spatial_ac4")
+                    ),
+                )
                 if not (asin and mpd):
                     raise RuntimeError(
                         f"Failed to obtain track manifest for {track_id}"
@@ -264,8 +282,13 @@ class ModuleInterface:
             )
 
             artists: list[str] = []
-            # NOTE the main artist is inside contributors only if the album as one or more contributors
-            if contributor_asins := tuple(track_data["artist"]["contributorAsins"]):
+            contributor_asins = tuple(track_data["artist"]["contributorAsins"])
+            # Most of the time there are more than one version of the main artist
+            # e.g the main artist with all the albums is track_data["artist"]["asin"]
+            # meanwhile there exists a alternative version of the same artist inside
+            # track_data["artist"]["contributorAsins"] (usually only one item)
+            # e.g https://music.amazon.co.jp/albums/B08P688B62
+            if len(contributor_asins) > 1:
                 artists.extend(
                     str(item["name"])
                     for item in self.mobile_session.get_metadata(contributor_asins)[
@@ -275,29 +298,30 @@ class ModuleInterface:
             else:
                 # Fallback, include the formatted artist name (might include contributors)
                 artists.append(track_data["artist"]["name"])
-            
+
             # Attempt to seperate each contributor if they're concatenated
             for artist in artists.copy():
-                artist_sep = {
-                    item
-                    for item in re.split(r", | & ", artist)
-                    if item
-                }
+                artist_sep = {item for item in re.split(r", | & ", artist) if item}
                 if not artist_sep:
                     continue
-                artists.extend(
-                    artist_sep
-                )
+                artists.extend(artist_sep)
                 artists.remove(artist)
-            
+
             # Prefer to have the primary artist name at the start
-            if album_data["primaryArtistName"] and album_data["primaryArtistName"] in artists:
+            if (
+                album_data["primaryArtistName"]
+                and album_data["primaryArtistName"] in artists
+            ):
                 artists.remove(album_data["primaryArtistName"])
                 artists.insert(0, album_data["primaryArtistName"])
 
             # Calculate the total disc avaliable by iterating each track and using the highest value
             disc_total = max(int(t["discNum"]) for t in album_data.get("tracks", [{}]))
-            writers = list(track_data.get("songWriters", []))
+            # Sanitize writers
+            writers = [
+                str(item).strip()
+                for item in track_data.get("songWriters", [])
+            ]
 
             # Sometimes writers are just one item in a list, seperated with /
             # e.g https://music.amazon.co.jp/albums/B0CG7FWYTK
@@ -486,7 +510,7 @@ class ModuleInterface:
         album_data = dict(
             data[album_id]
             if album_id in data
-            else self.mobile_session.get_album_info(album_id)
+            else self.mobile_session.get_album_info(album_id, use_alternative_naming=False)
         )
         # Force use the ASIN the API returns with
         album_id = album_data["asin"]
@@ -499,6 +523,7 @@ class ModuleInterface:
                 limit=100,
             )
         )
+        # album_data = self.mobile_session.get_album_info(album_id, use_alternative_naming=True)
 
         cover_url = search_data.get("artOriginal", {}).get(
             "artUrl", album_data.get("image")
@@ -509,7 +534,11 @@ class ModuleInterface:
         mapped_tracks = {
             f"{asin}_quality_mapping": self.mpd_to_quality_map(mpd, asin)
             for asin, mpd in self.mobile_session.get_tracks_manifest(
-                track["asin"] for track in album_data.get("tracks", [])[:10]
+                (track["asin"] for track in album_data.get("tracks", [])[:10]),
+                force_3d=any(
+                    not self.settings["force_non_spatial"] or self.settings[key]
+                    for key in ("prefer_spatial_mha1", "prefer_spatial_ac4")
+                ),
             )
             if mpd
         }
@@ -522,6 +551,21 @@ class ModuleInterface:
             ],
             key=lambda i: i.bitrate,
         )
+        track_extra_kwargs = (
+            {track["asin"]: track for track in album_data.get("tracks", [])}
+            | {album_id: album_data}
+            | mapped_tracks
+        )
+
+        if search_data:
+            track_extra_kwargs.update({f"{album_id}_search": search_data})
+        else:
+            self.print(
+                (
+                    f"Couldn't retrieve the search results for {album_data['title']}; {album_id}."
+                    f" Is this ASIN in the same region as the account?"
+                )
+            )
 
         return AlbumInfo(
             name=album_data.get(
@@ -542,10 +586,7 @@ class ModuleInterface:
             description="",  # optional
             quality=f"{best_audio_track.official_quality_name}] [{codec_data[best_audio_track.codec].pretty_name}",
             track_extra_kwargs={
-                "data": {track["asin"]: track for track in album_data.get("tracks", [])}
-                | {album_id: album_data}
-                | {f"{album_id}_search": search_data}
-                | mapped_tracks
+                "data": track_extra_kwargs
             },  # optional, whatever you want
         )
 
@@ -901,7 +942,9 @@ class ModuleInterface:
         track_to_use: AudioTrack | None = None
         # I tried, ok?
         # Attempt to find and choose preferred quality (has to be the same returned in the MPD)
-        mapped_qual_tracks = list(self._iter_over_tracks_to_quality_map(mapped_audio_tracks))
+        mapped_qual_tracks = list(
+            self._iter_over_tracks_to_quality_map(mapped_audio_tracks)
+        )
         if max_track_quality_to_use := self.settings["max_track_quality_to_use"]:
             max_track_quality_to_use = str(max_track_quality_to_use).upper()
             for (
@@ -1155,10 +1198,7 @@ class ModuleInterface:
         for quality_enum, qualities in reversed(self.quality_parse.items()):
 
             def key_for_sorting_avaliable_tracks(track: AudioTrack):
-                if any(
-                    item in track.quality
-                    for item in ("ATMOS", "LD", "RA360")
-                ):
+                if any(item in track.quality for item in ("ATMOS", "LD", "RA360")):
                     return track.bitrate
                 if quality_enum.value <= QualityEnum.LOSSLESS.value:
                     return track.quality_ranking

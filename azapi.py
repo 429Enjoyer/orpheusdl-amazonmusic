@@ -328,6 +328,7 @@ class AmazonMusicMobileAPI:
     def get_metadata(
         self,
         asins: str | typing.Sequence[str],
+        use_alternative_naming: typing.Optional[bool] = None,
         music_territory: typing.Optional[str] = None,
     ) -> dict[str, list[dict[str, typing.Any]]]:
         """
@@ -386,7 +387,9 @@ class AmazonMusicMobileAPI:
                 "filters": None,
                 "lang": self.credentials.web_client_config.locale,  # the lang locale of the phone/mobile app, en_US
                 "marketplaceId": None,
-                "metadataLang": None,  # null for locale based on IP, setting to a random string value returns it romanized
+                "metadataLang": "en"
+                if use_alternative_naming
+                else None,  # null for locale based on IP, setting to a random string value returns it romanized
                 "musicRequestIdentityContextToken": None,
                 "musicTerritory": music_territory,
                 "requestedContent": "ALL_STREAMABLE",  # FULL_CATALOG is valid too
@@ -539,7 +542,7 @@ class AmazonMusicMobileAPI:
             if result := self.find_item_by_asin_in_search_results(results, asin):
                 return result
         else:
-            return
+            return {}
 
     def get_page(
         self,
@@ -707,9 +710,17 @@ class AmazonMusicMobileAPI:
 
         return dict(response.json()["lyricsResponseList"][0])
 
-    def get_tracks_manifest(self, asins: typing.Iterable[str]):
+    def get_tracks_manifest(
+        self, asins: typing.Iterable[str], force_3d: typing.Optional[bool] = None
+    ):
         """
         Get the playback manifest of tracks (MPD)
+
+        Args:
+            asins: An iterable of str. They all must be a valid ASIN.
+            force_3d: typing.Optional[bool]: Sometimes 3D audio isn't attributed to the ASIN.
+            Setting this to true allows Amazon to subtitute the ASIN provided for another ASIN
+            which has 3D audio (different ASIN, same metadata). A downside for enabling this option results in UHD not being provided.
 
         Returns:
         A generator which yields a tuple of the corresponding track ASIN and
@@ -722,10 +733,12 @@ class AmazonMusicMobileAPI:
         # I love when my methods are CPU-bound!!
         for item in divide_sequence(list(asins), size=10):
             yield from self.parse_from_content_responses(
-                self._get_tracks_manifest(tuple(item))
+                self._get_tracks_manifest(tuple(item), force_3d)
             )
 
-    def _get_tracks_manifest(self, asins: tuple[str]):
+    def _get_tracks_manifest(
+        self, asins: tuple[str], force_3d: typing.Optional[bool] = None
+    ):
         """Internal function of get_tracks_manifest"""
         content_id_list = [
             {
@@ -768,7 +781,14 @@ class AmazonMusicMobileAPI:
                     "SIREN_KATANA",  # with 360 audio, but keeps on getting invalid key size (with group_pssh)? PSSH Entitled key size is always 32 bytes, not sure why (brings error if used)
                     # "SIREN_KATANA_NO_CLEAR_LEAD", #this and no entitlement, is what is used by Amazon Music Web
                 ],
-                # "try3dAsinSubstitution": True,
+                # Sometimes having tryAsinSubstitution set to true
+                # but no try3dAsinSubstitution
+                # fails to get 360RA audio (3-6) for these albums:
+                # https://music.amazon.co.jp/albums/B08P6QMJ9D?trackAsin=B08P6S83PK
+                # https://music.amazon.ca/albums/B08P688B62
+                # Having both Asin and 3dAsin substitution
+                # has 360RA spatial audio, but no UHD
+                "try3dAsinSubstitution": True if force_3d else False,
                 "tryAsinSubstitution": True,
             },
         )
@@ -837,27 +857,31 @@ class AmazonMusicMobileAPI:
 
     # Shortcuts
 
-    def get_track_manifest(self, track_asin: str):
+    def get_track_manifest(
+        self, track_asin: str, force_3d: typing.Optional[bool] = None
+    ):
         return next(
-            self.parse_from_content_responses(self._get_tracks_manifest((track_asin,))),
+            self.parse_from_content_responses(
+                self._get_tracks_manifest((track_asin,), force_3d)
+            ),
             (None, None),
         )
 
-    def get_track_info(self, track_asin: str):
-        resp = self.get_metadata(track_asin)["trackList"]
+    def get_track_info(self, track_asin: str, *args, **kwargs):
+        resp = self.get_metadata(track_asin, *args, **kwargs)["trackList"]
         if len(resp) > 1 or not resp:
             raise ValueError(f"Failed to get track metadata. {resp}")
         return resp[0]
 
-    def get_album_info(self, album_asin: str):
-        resp = self.get_metadata(album_asin)["albumList"]
+    def get_album_info(self, album_asin: str, *args, **kwargs):
+        resp = self.get_metadata(album_asin, *args, **kwargs)["albumList"]
         if len(resp) > 1 or not resp:
             raise ValueError(f"Failed to get album metadata. {resp}")
 
         return resp[0]
 
-    def get_artist_info(self, artist_asin: str):
-        resp = self.get_metadata(artist_asin)["artistList"]
+    def get_artist_info(self, artist_asin: str, *args, **kwargs):
+        resp = self.get_metadata(artist_asin, *args, **kwargs)["artistList"]
         if len(resp) > 1 or not resp:
             raise ValueError(f"Failed to get artist metadata. {resp}")
         return resp[0]
