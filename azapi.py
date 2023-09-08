@@ -11,6 +11,7 @@ import secrets
 import time
 import typing
 import uuid
+import concurrent.futures
 from datetime import datetime, timedelta
 from enum import Enum, auto
 from urllib.parse import parse_qs, urlencode
@@ -242,24 +243,27 @@ class AmazonMusicMobileAPI:
         # Sometimes we get a DNS resolve error (too many requests for manifest?), this attempts to retry 5 times
         attempt = 0
         resp = None
+        last_http_exc = None
         while attempt <= 5:
             attempt += 1
             try:
                 LOGGER.debug("Handling request: %s", request)
+                # print(f"Handling request: {request} at {time.perf_counter()}")
                 resp = session.send(request)
                 resp.raise_for_status()
             except httpx.HTTPError as ce:
                 time.sleep(10)
                 LOGGER.error(ce)
                 LOGGER.debug(ce, exc_info=True)
+                last_http_exc = ce
                 continue
             else:
                 # return the response when successful
                 return resp
         else:
-            if not resp:
-                return
-            LOGGER.error(resp.text)
+            if resp:
+                LOGGER.error(resp.text)
+            raise last_http_exc or RuntimeError()
 
     def post(
         self,
@@ -619,6 +623,34 @@ class AmazonMusicMobileAPI:
         )
         return dict(resp.json())
 
+    def get_playlist(self, asin: str):
+        """
+        Get a playlist and its tracks.
+
+        Args:
+            asin: A valid ASIN.
+        """
+
+        resp = self.post(
+            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/playlists/",
+            headers={
+                "x-amz-target": "com.amazon.musicplaylist.model.MusicPlaylistService.getCatalogPlaylistByAsin",
+                "User-Agent": self.APP_USER_AGENT,
+                "x-amzn-requestid": str(uuid.uuid4()).lower(),
+            },
+            data={
+                "asin": asin,
+                "contentEncoding": True,
+                "customerInfo": {
+                    "customerId": "",
+                    "deviceId": self.credentials.device_info["device_serial_number"],
+                    "deviceType": AmazonMobileApplication.MUSIC.device_type,
+                },
+                "musicTerritory": self.credentials.web_client_config.music_territory,
+            },
+        )
+        return dict(resp.json())
+
     def get_recent_tracks(self):
         """
         Get the logged in user's recent tracks.
@@ -730,11 +762,18 @@ class AmazonMusicMobileAPI:
         TRACK_PSSH + SIREN_KATANA_NO_CLEAR_LEAD = No issues, only up to lossless
         """
         # Amazon only allows a specific amount of ASINs to be requested at once (10 asins)
-        # I love when my methods are CPU-bound!!
-        for item in divide_sequence(list(asins), size=10):
-            yield from self.parse_from_content_responses(
-                self._get_tracks_manifest(tuple(item), force_3d)
-            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(self._get_tracks_manifest, tuple(item), force_3d)
+                for item in divide_sequence(list(asins), size=10)
+            ]
+            executor.shutdown(wait=True)
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if not result:
+                    continue
+                yield from self.parse_from_content_responses(result)
 
     def _get_tracks_manifest(
         self, asins: tuple[str], force_3d: typing.Optional[bool] = None
@@ -747,7 +786,7 @@ class AmazonMusicMobileAPI:
             }
             for asin in asins
         ]
-        music_agent = f"Harley/{self.harley_version} Harley/{self.application_version} ( {str(uuid.uuid4())} {asins[0]} )"  # {asins[0]}
+        music_agent = f"Harley/{self.harley_version} Harley/{self.application_version} ( {str(uuid.uuid4())} {asins[0]} )"
         response = self.post(
             url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/dmls/getDashManifestsV2",
             headers={
@@ -823,7 +862,7 @@ class AmazonMusicMobileAPI:
 
         `WIDEVINE_ENTITLEMENT`, `PLAYREADY`, `FAIRPLAY`, `WIDEVINE`
 
-        Entitlement is not possible without the proper widevine device, 9480)
+        Entitlement is not possible without the proper widevine device, 9480
         """
         response = self.post(
             url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/dmls/getLicenseForPlaybackV2",
@@ -936,7 +975,7 @@ class AmazonMusicMobileAPI:
         for document in self.get_documents_from_search_results(results):
             avaliable_asins = [
                 str(document.get(item))
-                for item in ("albumAsin", "artistAsin", "asin")
+                for item in ("albumAsin", "artistAsin", "asin", "seriesAsin")
                 if document.get(item)
             ]
             if asin not in avaliable_asins:

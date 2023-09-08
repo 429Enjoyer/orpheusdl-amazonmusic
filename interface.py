@@ -5,18 +5,22 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import typing
 import json
 import dataclasses
 import itertools
 from datetime import datetime
+import concurrent.futures
 from urllib.parse import urlparse
 from uuid import UUID, uuid1, uuid4
+from pymp4.parser import Box
 
 import aria2p
 import ffmpeg
 import natsort
 from pywidevine import PSSH, Cdm, Device
+
 from tqdm import tqdm
 from xml.etree import ElementTree
 
@@ -41,6 +45,8 @@ class AudioTrack:
     quality: str
     quality_ranking: int
     pssh: PSSH
+    raw_pssh: bytes
+    # pssh: typing.Any
     bit_depth: Optional[int] = None
 
     def to_dict(self):
@@ -285,7 +291,7 @@ class ModuleInterface:
             contributor_asins = tuple(track_data["artist"]["contributorAsins"])
             # Most of the time there are more than one version of the main artist
             # e.g the main artist with all the albums is track_data["artist"]["asin"]
-            # meanwhile there exists a alternative version of the same artist inside
+            # meanwhile there exists a alternative version of the same artist inside (no albums)
             # track_data["artist"]["contributorAsins"] (usually only one item)
             # e.g https://music.amazon.co.jp/albums/B08P688B62
             if len(contributor_asins) > 1:
@@ -307,6 +313,8 @@ class ModuleInterface:
                 artists.extend(artist_sep)
                 artists.remove(artist)
 
+            # Remove duplicates
+            # artists = list(set(artists))
             # Prefer to have the primary artist name at the start
             if (
                 album_data["primaryArtistName"]
@@ -318,10 +326,7 @@ class ModuleInterface:
             # Calculate the total disc avaliable by iterating each track and using the highest value
             disc_total = max(int(t["discNum"]) for t in album_data.get("tracks", [{}]))
             # Sanitize writers
-            writers = [
-                str(item).strip()
-                for item in track_data.get("songWriters", [])
-            ]
+            writers = [str(item).strip() for item in track_data.get("songWriters", [])]
 
             # Sometimes writers are just one item in a list, seperated with /
             # e.g https://music.amazon.co.jp/albums/B0CG7FWYTK
@@ -354,7 +359,7 @@ class ModuleInterface:
                         )
                     }
                 )
-            genres = [
+            genres = {
                 # sanitize and format the genre name from search data
                 # this genre tends to be more specific however,
                 # it may not be always avaliable
@@ -362,16 +367,16 @@ class ModuleInterface:
                 " ".join(
                     re.split("_| ", str(search_data.get("primaryGenre", "")))
                 ).title()
-            ]
+            }
             if album_data["productDetails"]["primaryGenreName"] not in genres:
                 # this genre name tends to be broad
-                genres.append(album_data["productDetails"]["primaryGenreName"])
+                genres.add(album_data["productDetails"]["primaryGenreName"])
 
             tags = Tags(
                 album_artist=album_data["primaryArtistName"],
                 composer=composers,
                 copyright=album_data["productDetails"]["copyright"],
-                isrc=track_data["isrc"],
+                isrc=track_data.get("isrc"),
                 # upc="",
                 disc_number=int(track_data["discNum"] or 1),
                 total_discs=disc_total,
@@ -379,7 +384,7 @@ class ModuleInterface:
                 total_tracks=int(album_data["trackCount"] or 1),  # None/0/1 if no discs
                 # replay_gain=0.0,
                 # replay_peak=0.0,
-                genres=genres,
+                genres=list(genres),
                 label=album_data["productDetails"]["label"],
                 release_date=release_datetime.strftime(
                     "%Y-%m-%d"
@@ -389,6 +394,10 @@ class ModuleInterface:
             )
 
             artwork_url = search_data.get("artOriginal", {}).get("artUrl")
+            if not artwork_url:
+                # If the search data is actually self.get_album_info's playlist track
+                # TODO, change to f"{track_asin}_playlist_track"
+                artwork_url = search_data.get("metadata", {}).get("albumArt", {}).get("url")
             if not artwork_url:
                 self.print(
                     "Failed to get original artwork, using lower resolution cover art.."
@@ -405,7 +414,7 @@ class ModuleInterface:
                 cover_url=artwork_url,  # make sure to check module_controller.orpheus_options.default_cover_options
                 release_year=int(release_datetime.strftime("%Y")),
                 explicit=track_data["parentalControls"]["hasExplicitLanguage"],
-                artist_id=track_data["artist"]["asin"],  # optional
+                artist_id=track_data.get("artist", {}).get("asin", ""),  # optional
                 duration=track_data["duration"],
                 # animated_cover_url="",  # optional
                 # description="",  # optional
@@ -467,8 +476,10 @@ class ModuleInterface:
                 decrypted_track_location,
                 exists_ok=True,
             )
+
             LOGGER.debug("Ok wth decryption")
             self.cdm.close(session_id)
+
             silentremove(encrypted_track_location)
 
             selected_codec_data = codec_data[audio_track.codec]
@@ -510,31 +521,63 @@ class ModuleInterface:
         album_data = dict(
             data[album_id]
             if album_id in data
-            else self.mobile_session.get_album_info(album_id, use_alternative_naming=False)
+            else self.mobile_session.get_album_info(
+                album_id, use_alternative_naming=False
+            )
         )
         # Force use the ASIN the API returns with
         album_id = album_data["asin"]
-        search_data = dict(
-            data[f"{album_id}_search"]
-            if data and f"{album_id}_search" in data
-            else self.mobile_session.search(
+
+        search_data = None
+        if search_data := data.get(f"{album_id}_search"):
+            search_data = search_data
+        # These types of album/tracks are unique as they only appear in Playlists (curated by Amazon Music)
+        elif (
+            album_data.get("productDetails", {}).get("label")
+            == "Amazon Content Service"
+        ):
+            # We have to trust that Amazon Search API returns the correct playlist that has the album/track inside of it
+            for p_search_data in self.mobile_session.search(
+                query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
+                search_types=("catalog_playlist",),
+                limit=100,
+            ):
+                p_data = self.mobile_session.get_playlist(p_search_data["seriesAsin"])
+                for track in p_data.get("playlist", {}).get("tracks", []):
+                    if track.get("metadata", {}).get("albumAsin") != album_id:
+                        continue
+                    search_data = track
+                    break
+                else:
+                    continue
+                break
+            else:
+                raise ValueError("No tracks available!")
+
+        # Everything and anything
+        if not search_data:
+            search_data = self.mobile_session.search(
                 query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
                 asins=(album_id, album_data["requestedAsin"]),
+                search_types=("catalog_album",),
                 limit=100,
             )
-        )
         # album_data = self.mobile_session.get_album_info(album_id, use_alternative_naming=True)
 
+        # Parse as if it is from the Search API
+        # Else parse if it is from the Playlist API
+        # Else retrieve the default 600x600 cover art (unlikely)
         cover_url = search_data.get("artOriginal", {}).get(
-            "artUrl", album_data.get("image")
+            "artUrl",
+            search_data.get("metadata", {})
+            .get("albumArt", {})
+            .get("url", album_data.get("image")),
         )
 
-        # Scan through the first 10 tracks (to limit delay if force_album_format)
-        # I think httpx.Client.send is CPU bounded..
         mapped_tracks = {
             f"{asin}_quality_mapping": self.mpd_to_quality_map(mpd, asin)
             for asin, mpd in self.mobile_session.get_tracks_manifest(
-                (track["asin"] for track in album_data.get("tracks", [])[:10]),
+                (track["asin"] for track in album_data.get("tracks", [])),  # [:10]
                 force_3d=any(
                     not self.settings["force_non_spatial"] or self.settings[key]
                     for key in ("prefer_spatial_mha1", "prefer_spatial_ac4")
@@ -542,6 +585,7 @@ class ModuleInterface:
             )
             if mpd
         }
+
         best_audio_track = max(
             [
                 self._get_usable_audio_track_of_mapped_quailty(
@@ -617,7 +661,7 @@ class ModuleInterface:
         )
 
     def get_artist_info(
-        self, artist_id: str, get_credited_albums: bool
+        self, artist_id: str, get_credited_albums: bool, data: dict = {}
     ) -> ArtistInfo:  # Mandatory if ModuleModes.download
         # get_credited_albums means stuff like remix compilations the artist was part of
         try:
@@ -635,28 +679,40 @@ class ModuleInterface:
         self.print(
             f"{module_information.service_name}: Loading albums for {artist_data['name']}, this may take a while.."
         )
-        for album in self.mobile_session.search(
-            query=f'"{artist_name}"',
-            search_types=("catalog_album",),
-            limit=1000,
-        ):
-            if artist_name not in album.get("artistName", ""):
-                continue
-            album_metadata = self.mobile_session.get_album_info(album["asin"])
-            # Filter out foreign albums with the same artist name (but not ID)
-            if (
-                not album_metadata["artist"]["contributorAsins"]
-                and album_metadata["artist"]["asin"] != artist_id
-            ):
-                continue
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                executor.submit(
+                    self.mobile_session.get_album_info, album["asin"]
+                ): album
+                for album in self.mobile_session.search(
+                    query=f'"{artist_name}"',
+                    search_types=("catalog_album",),
+                    limit=1000,
+                )
+                if artist_name in album.get("artistName", "")
+            }
+            executor.shutdown(wait=True)
+            for future in concurrent.futures.as_completed(futures):
+                album_metadata = future.result()
+                if not album_metadata:
+                    continue
+                album = futures[future]
+                # Filter out foreign albums with the same artist name (but not ID)
+                if (
+                    not album_metadata["artist"]["contributorAsins"]
+                    and album_metadata["artist"]["asin"] != artist_id
+                ):
+                    continue
 
-            # Assume that if they aren't equal, they are credited albums
-            # artist_id != album.get("artistAsin")
-            if (artist_name != album.get("artistName", "")) and not get_credited_albums:
-                continue
+                # Assume that if they aren't equal, they are credited albums
+                # artist_id != album.get("artistAsin")
+                if (
+                    artist_name != album.get("artistName", "")
+                ) and not get_credited_albums:
+                    continue
 
-            albums_metadata.append(album_metadata)
-            albums.append(album)
+                albums_metadata.append(album_metadata)
+                albums.append(album)
 
         if not albums:
             self.print(f"No albums found for {artist_name} with ID: {artist_id}.")
@@ -737,17 +793,12 @@ class ModuleInterface:
         track_info: typing.Optional[TrackInfo] = None,
         limit: int = 10,
     ):  # Mandatory
-        if (
-            query_type is DownloadTypeEnum.artist
-            or query_type is DownloadTypeEnum.playlist
-        ):
+        if query_type is DownloadTypeEnum.playlist:
             # super lazy
             raise TypeError(f"{query_type} is not supported yet!")
 
-        results = {}
-        search_type = {item.name: f"catalog_{item.name}" for item in DownloadTypeEnum}[
-            query_type.name
-        ]
+        results = []
+        search_type = f"catalog_{query_type.name}"
         # if track_info and track_info.tags.isrc:
         #     results = list(self.mobile_session.get_documents_from_search_results(
         #         self.mobile_session.search(
@@ -764,16 +815,19 @@ class ModuleInterface:
         return [
             SearchResult(
                 result_id=i["asin"],
-                name=i["title"],  # optional only if a lyrics/covers only module
-                artists=[
-                    i["artistName"]
-                ],  # optional only if a lyrics/covers only module or an artist search
+                name=i.get("title")
+                or i.get("name"),  # optional only if a lyrics/covers only module
+                artists=[i["artistName"]]
+                if i.get("artistName")
+                else None,  # optional only if a lyrics/covers only module or an artist search
                 year=datetime.fromtimestamp(
                     round(float(str(i.get("originalReleaseDate"))))
-                ).strftime(
-                    "%Y"
-                ),  # optional
-                explicit=i["parentalControls"]["hasExplicitLanguage"],  # optional
+                ).strftime("%Y")
+                if query_type in (DownloadTypeEnum.track, DownloadTypeEnum.album)
+                else None,  # optional
+                explicit=i["parentalControls"]["hasExplicitLanguage"]
+                if i.get("parentalControls")
+                else None,  # optional
                 additional=natsort.natsorted(
                     map(
                         lambda item: {
@@ -786,7 +840,10 @@ class ModuleInterface:
                         i.get("contentEncoding", []),
                     ),
                     key=len,
-                ),  # optional, used to convey more info when using orpheus.py search (not luckysearch, for obvious reasons)
+                )
+                + [
+                    i.get("asin")
+                ],  # optional, used to convey more info when using orpheus.py search (not luckysearch, for obvious reasons)
                 extra_kwargs={
                     "data": {f"{i['asin']}_search": i}
                 }  # optional, whatever you want. NOTE: BE CAREFUL! this can be given to:
@@ -817,21 +874,7 @@ class ModuleInterface:
         # Otherwise use the OrpheusDL default method
         aria2c_bin = shutil.which("aria2c")
         if aria2c_bin and use_aria2c:
-            # with YoutubeDL(
-            #     {
-            #         "quiet": True,
-            #         "no_warnings": True,
-            #         "outtmpl": location,  # must be a path including the filename
-            #         "allow_unplayable_formats": True,
-            #         "fixup": "never",
-            #         "overwrites": True,
-            #         "external_downloader": "aria2c",
-            #         # "logger": LOGGER
-            #     }
-            # ) as ydl:
-            #     ydl.download(url)
-
-            ModuleInterface.download_with_aria2c(url, location)
+            self.download_with_aria2c(url, location)
         else:
             download_file(
                 url,
@@ -1065,6 +1108,7 @@ class ModuleInterface:
                     raise ValueError("Only supports audio MPDs!")
 
                 pssh = None
+                raw_pssh = None
 
                 for content_property in adaptation_set.findall("ContentProtection"):
                     if (
@@ -1078,9 +1122,11 @@ class ModuleInterface:
                     if not (pssh_elem is not None and pssh_elem.text):
                         continue
                     pssh = PSSH(pssh_elem.text, strict=True)
+
                     break
 
                 else:
+                    # continue
                     raise ValueError("Failed to find PSSH.")
 
                 supplemental_properties = adaptation_set.findall("SupplementalProperty")
@@ -1151,6 +1197,7 @@ class ModuleInterface:
                             ),
                             quality=quality,
                             pssh=pssh,
+                            raw_pssh=raw_pssh,
                         )
                     )
 
