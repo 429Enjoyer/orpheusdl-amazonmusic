@@ -181,7 +181,7 @@ class AmazonMusicMobileAPI:
         }
 
         if not load_credentials:
-            return
+            return session
 
         inst = cls.register(application=application, **items)
         print(
