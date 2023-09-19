@@ -1827,6 +1827,7 @@ class AmazonMusicMobileAPI:
             "JP": "A1VC38T7YXB528",
             "GB": "A1F83G8C2ARO7P",
             "AU": "A39IBJ37TRP1C6",
+            "NZ": "A39IBJ37TRP1C6",
         }[country_code.upper()]
 
 

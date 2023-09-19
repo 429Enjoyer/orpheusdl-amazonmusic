@@ -26,12 +26,11 @@ from xml.etree import ElementTree
 
 
 from utils.models import *
-from utils.utils import create_temp_filename, download_file, silentremove
+from utils.utils import create_temp_filename, download_file, download_to_temp, silentremove
 
 from .azapi import AmazonMusicMobileAPI, AmazonMusicMobileAPICredentials
 
 LOGGER = logging.getLogger(__name__)
-
 
 @dataclasses.dataclass(slots=True)
 class AudioTrack:
@@ -39,13 +38,12 @@ class AudioTrack:
     codec: CodecEnum
     bitrate: int
     """ As kilobits per second (kbps) """
-    sample_rate: int
+    sample_rate: float
     url: str
     official_quality_name: str
     quality: str
     quality_ranking: int
     pssh: PSSH
-    raw_pssh: bytes
     # pssh: typing.Any
     bit_depth: Optional[int] = None
 
@@ -57,8 +55,9 @@ class AudioTrack:
 
 module_information = ModuleInformation(  # Only service_name and module_supported_modes are mandatory
     service_name="Amazon Music",
-    module_supported_modes=ModuleModes.download | ModuleModes.lyrics,
-    # | ModuleModes.covers,
+    module_supported_modes=ModuleModes.download
+    | ModuleModes.lyrics
+    | ModuleModes.covers,
     # | ModuleModes.credits,
     # flags = ModuleFlags.hidden,
     # Flags:
@@ -167,11 +166,12 @@ class ModuleInterface:
         mobile_session = AmazonMusicMobileAPI.login_via_mobile(
             email, password, self.settings["country_tld"], self.settings["country"]
         )
-        if not mobile_session:
+        if not isinstance(mobile_session, AmazonMusicMobileAPI):
+            # die
             raise Exception("Login failed")
 
         self.mobile_session = mobile_session
-        LOGGER.debug(self.mobile_session._retrieve_capability())
+        LOGGER.debug(mobile_session._retrieve_capability())
 
         return self.mobile_session
 
@@ -392,26 +392,29 @@ class ModuleInterface:
                 # comment=comment,
                 extra_tags=extra_tags,
             )
-
-            artwork_url = search_data.get("artOriginal", {}).get("artUrl")
-            if not artwork_url:
-                # If the search data is actually self.get_album_info's playlist track
-                # TODO, change to f"{track_asin}_playlist_track"
-                artwork_url = search_data.get("metadata", {}).get("albumArt", {}).get("url")
-            if not artwork_url:
-                self.print(
-                    "Failed to get original artwork, using lower resolution cover art.."
+            
+            cover_url, search_data = self.get_hi_res_cover(
+                asins=(album_id, album_data["requestedAsin"]),
+                query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
+                search_data=search_data
+            )
+            if not cover_url:
+                # Default 600 x 600 cover art
+                cover_url = str(album_data.get("image", ""))
+            else:
+                cover_url = self.format_cover_url(
+                    cover_url,
+                    self.options.default_cover_options
                 )
-                artwork_url = album_data.get("image", "")
 
             return TrackInfo(
-                name=track_data["title"],
+                name=self.sanitize_meta_name(track_data["title"]) if track_data["parentalControls"]["hasExplicitLanguage"] else track_data["title"],
                 album_id=album_id,
-                album=track_data["album"]["title"],
+                album=self.sanitize_meta_name(track_data["album"]["title"]) if track_data["parentalControls"]["hasExplicitLanguage"] else track_data["album"]["title"],
                 artists=artists,
                 tags=tags,
                 codec=track_to_use.codec,
-                cover_url=artwork_url,  # make sure to check module_controller.orpheus_options.default_cover_options
+                cover_url=cover_url,  # make sure to check module_controller.orpheus_options.default_cover_options
                 release_year=int(release_datetime.strftime("%Y")),
                 explicit=track_data["parentalControls"]["hasExplicitLanguage"],
                 artist_id=track_data.get("artist", {}).get("asin", ""),  # optional
@@ -445,6 +448,7 @@ class ModuleInterface:
         try:
             os.makedirs("temp/", exist_ok=True)
             encrypted_track_location = f"{create_temp_filename()}.mp4"
+            
             self.download(
                 audio_track.url,
                 encrypted_track_location,
@@ -476,9 +480,10 @@ class ModuleInterface:
                 decrypted_track_location,
                 exists_ok=True,
             )
+            if not os.path.exists(decrypted_track_location):
+                raise FileNotFoundError("Unable to decrypt the downloaded media file")
 
             LOGGER.debug("Ok wth decryption")
-            self.cdm.close(session_id)
 
             silentremove(encrypted_track_location)
 
@@ -501,14 +506,15 @@ class ModuleInterface:
                 final_decrypted_track_location,
                 loglevel="warning",
                 audio_bitrate=f"{audio_track.bitrate}k",
+                af=f"atrim=start_sample={audio_track.sample_rate * 6.5}"
             ).run()
             silentremove(decrypted_track_location)
 
-        except Exception as e:
-            LOGGER.error(e, exc_info=True)
+        # except Exception as e:
+        #     LOGGER.error(e, exc_info=True)
+        finally:
             if session_id:
                 self.cdm.close(session_id)
-            return
 
         return TrackDownloadInfo(
             download_type=DownloadEnum.TEMP_FILE_PATH,
@@ -528,56 +534,27 @@ class ModuleInterface:
         # Force use the ASIN the API returns with
         album_id = album_data["asin"]
 
-        search_data = None
-        if search_data := data.get(f"{album_id}_search"):
-            search_data = search_data
-        # These types of album/tracks are unique as they only appear in Playlists (curated by Amazon Music)
-        elif (
-            album_data.get("productDetails", {}).get("label")
-            == "Amazon Content Service"
-        ):
-            # We have to trust that Amazon Search API returns the correct playlist that has the album/track inside of it
-            for p_search_data in self.mobile_session.search(
-                query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
-                search_types=("catalog_playlist",),
-                limit=100,
-            ):
-                p_data = self.mobile_session.get_playlist(p_search_data["seriesAsin"])
-                for track in p_data.get("playlist", {}).get("tracks", []):
-                    if track.get("metadata", {}).get("albumAsin") != album_id:
-                        continue
-                    search_data = track
-                    break
-                else:
-                    continue
-                break
-            else:
-                raise ValueError("No tracks available!")
-
-        # Everything and anything
-        if not search_data:
-            search_data = self.mobile_session.search(
-                query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
-                asins=(album_id, album_data["requestedAsin"]),
-                search_types=("catalog_album",),
-                limit=100,
-            )
-        # album_data = self.mobile_session.get_album_info(album_id, use_alternative_naming=True)
-
-        # Parse as if it is from the Search API
-        # Else parse if it is from the Playlist API
-        # Else retrieve the default 600x600 cover art (unlikely)
-        cover_url = search_data.get("artOriginal", {}).get(
-            "artUrl",
-            search_data.get("metadata", {})
-            .get("albumArt", {})
-            .get("url", album_data.get("image")),
+        cover_url, search_data = self.get_hi_res_cover(
+            asins=(album_id, album_data["requestedAsin"]),
+            query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
+            search_data=data.get(f"{album_id}_search")
         )
+        if not cover_url:
+            # Default 600 x 600 cover art
+            cover_url = str(album_data.get("image", ""))
+            tracks_cover_art = cover_url
+        else:
+            tracks_cover_art = self.format_cover_url(
+                cover_url,
+                self.options.default_cover_options
+            )
+
+        # album_data = self.mobile_session.get_album_info(album_id, use_alternative_naming=True)
 
         mapped_tracks = {
             f"{asin}_quality_mapping": self.mpd_to_quality_map(mpd, asin)
             for asin, mpd in self.mobile_session.get_tracks_manifest(
-                (track["asin"] for track in album_data.get("tracks", [])),  # [:10]
+                (track["asin"] for track in album_data.get("tracks", [])),
                 force_3d=any(
                     not self.settings["force_non_spatial"] or self.settings[key]
                     for key in ("prefer_spatial_mha1", "prefer_spatial_ac4")
@@ -610,22 +587,21 @@ class ModuleInterface:
                     f" Is this ASIN in the same region as the account?"
                 )
             )
+        explicit = any(track["parentalControls"]["hasExplicitLanguage"] for track in album_data.get("tracks", []))
 
         return AlbumInfo(
-            name=album_data.get(
-                "title", "Unknown name"
-            ),  # "".join(str(album_data.get("title", "Unknown")).rsplit("[Explicit]")),
+            # name=album_data.get("title", "Unknown name"),
+            name=self.sanitize_meta_name(album_data.get("title", "Unknown")) if explicit else album_data.get("title", "Unknown"),
             artist=album_data.get("primaryArtistName", ""),
             tracks=[track["asin"] for track in album_data.get("tracks", [])],
             release_year=int(self._get_date_from_metadata(album_data).strftime("%Y")),
-            # Uncomment if you wish to add [E] (Amazon already returns [Explicit] inside the name)
-            # explicit=any(track["parentalControls"]["hasExplicitLanguage"] for track in album_data.get("tracks", [])),
+            explicit=explicit,
             duration=album_data.get("duration"),
             artist_id=album_data.get("artist", {}).get("asin"),  # optional
             # booklet_url="",  # optional
             cover_url=cover_url,  # optional
             cover_type=ImageFileTypeEnum.jpg,  # optional
-            all_track_cover_jpg_url=cover_url,  # technically optional, but HIGHLY recommended
+            all_track_cover_jpg_url=tracks_cover_art,  # technically optional, but HIGHLY recommended
             animated_cover_url="",  # optional
             description="",  # optional
             quality=f"{best_audio_track.official_quality_name}] [{codec_data[best_audio_track.codec].pretty_name}",
@@ -737,6 +713,7 @@ class ModuleInterface:
     def get_track_credits(
         self, track_id: str, data={}
     ):  # Mandatory if ModuleModes.credits
+        raise NotImplementedError
         track_data = (
             data[track_id]
             if track_id in data
@@ -749,20 +726,34 @@ class ModuleInterface:
     def get_track_cover(
         self, track_id: str, cover_options: CoverOptions, data={}
     ) -> CoverInfo:  # Mandatory if ModuleModes.covers
-        track_data = dict(
-            (
-                data[track_id]
-                if track_id in data
-                else self.mobile_session.get_track_info(track_id)
-            )
+        track_data = (
+            data[track_id]
+            if track_id in data
+            else self.mobile_session.get_track_info(track_id)
         )
-        print(self.mobile_session.get_track_info(track_id))
-        cover_url: str | None = str(track_data.get("album", {}).get("image") or None)
+        album_id = str(track_data["album"]["asin"])
+        album_data = (
+            data[track_id]
+            if track_id in data
+            else self.mobile_session.get_album_info(album_id)
+        )
+        cover_url, _ = self.get_hi_res_cover(
+            asins=(album_id, album_data["requestedAsin"]),
+            query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
+            search_data=data.get(f"{album_id}_search")
+        )
+        if not cover_url:
+            # Default 600 x 600 cover art
+            cover_url = str(album_data.get("image", ""))
+        else:
+            cover_url = self.format_cover_url(
+                cover_url,
+                self.options.default_cover_options
+            )
+
         return CoverInfo(
             url=cover_url,
-            file_type=ImageFileTypeEnum.jpg
-            if cover_url and cover_url.endswith("jpg")
-            else None,
+            file_type=self.options.default_cover_options.file_type,
         )
 
     def get_track_lyrics(
@@ -856,6 +847,45 @@ class ModuleInterface:
         ]
 
     # helpers
+    
+    def get_hi_res_cover(self, asins: typing.Iterable[str], query: str, search_data: typing.Optional[dict] = {}):
+        search_data = None
+        cover_url = None
+
+        # Typically this works
+        if not search_data:
+            search_data = self.mobile_session.search(
+                query=query,
+                asins=tuple(asins),
+                search_types=("catalog_album",),
+                limit=100,
+            )
+         
+        cover_url = str(search_data.get("artOriginal", {}).get("artUrl", ""))
+
+        if not cover_url:
+            # These types of album/tracks are unique as they only appear in Playlists (curated by Amazon Music)
+            # e.g tracks with the label "Amazon Content Service"
+            # We have to trust that Amazon Search API returns the correct playlist that has the album/track inside of it
+            for p_search_data in self.mobile_session.search(
+                # query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
+                query=query,
+                search_types=("catalog_playlist",),
+                limit=100,
+            ):
+                p_data = self.mobile_session.get_playlist(p_search_data["seriesAsin"])
+                for track in p_data.get("playlist", {}).get("tracks", []):
+                    if track.get("metadata", {}).get("albumAsin") not in asins:
+                        continue
+                    search_data = track
+                    cover_url = str(track.get("metadata", {}).get("albumArt", {}).get("url", ""))
+                    break
+                else:
+                    continue
+                break
+
+
+        return cover_url, search_data
 
     @staticmethod
     def _get_date_from_metadata(album_data: dict[str, typing.Any]):
@@ -869,11 +899,29 @@ class ModuleInterface:
             / 1000
         )
 
+    @staticmethod
+    def milliseconds_to_lrc_time(milliseconds: int):
+        # Convert milliseconds to the proper LRC time format [mm:ss.xxx]
+        return f"{milliseconds // 60000:02}:{(milliseconds // 1000) % 60:02}.{milliseconds % 1000:03}"
+    
+    @staticmethod
+    def sanitize_meta_name(name: str):
+        return name.rsplit(" [Explicit]", maxsplit=1)[0]
+    
+    
+    @staticmethod
+    def format_cover_url(url: str, options: CoverOptions):
+        frag_url, extension = url.rsplit(".", 1)
+        file_format = f"_FM{options.file_type.name}" if options.file_type != ImageFileTypeEnum.jpg else ""
+        
+        new_url = f"{frag_url}.SX{options.resolution}{file_format}.{extension}"
+        
+        return new_url
+
     def download(self, url: str, location: str, use_aria2c: typing.Optional[bool]):
-        # Attempt to use download with aria2c (faster)
+        # Attempt to use download with aria2c (faster but error prone)
         # Otherwise use the OrpheusDL default method
-        aria2c_bin = shutil.which("aria2c")
-        if aria2c_bin and use_aria2c:
+        if shutil.which("aria2c") and use_aria2c:
             self.download_with_aria2c(url, location)
         else:
             download_file(
@@ -881,11 +929,6 @@ class ModuleInterface:
                 location,
                 enable_progress_bar=True,
             )
-
-    @staticmethod
-    def milliseconds_to_lrc_time(milliseconds: int):
-        # Convert milliseconds to the proper LRC time format [mm:ss.xx]
-        return f"{milliseconds // 60000:02}:{(milliseconds // 1000) % 60:02}.{milliseconds % 1000:03}"
 
     @classmethod
     def download_with_aria2c(cls, url: str, output_path: str):
@@ -1108,7 +1151,6 @@ class ModuleInterface:
                     raise ValueError("Only supports audio MPDs!")
 
                 pssh = None
-                raw_pssh = None
 
                 for content_property in adaptation_set.findall("ContentProtection"):
                     if (
@@ -1178,17 +1220,17 @@ class ModuleInterface:
                         sp = representation.find("SupplementalProperty")
                         if sp is not None:
                             bit_depth = int(sp.get("value", 0))
-
+                    
                     avaliable_tracks.append(
                         AudioTrack(
                             asin=track_asin,
                             codec=codec,
                             bit_depth=bit_depth,
                             bitrate=int(
-                                int(representation.get("bandwidth") or 0) / 1000
-                            ),  # im not exactly sure why i have to divide it by 1000 but meh
-                            sample_rate=int(
-                                representation.get("audioSamplingRate") or 0
+                                int(representation.get("bandwidth") or 0) // 1000
+                            ),
+                            sample_rate=float(
+                                int(representation.get("audioSamplingRate") or 0) / 1000
                             ),
                             url=media_url,
                             official_quality_name=official_quality_name,
@@ -1196,8 +1238,7 @@ class ModuleInterface:
                                 representation.get("qualityRanking", 0)
                             ),
                             quality=quality,
-                            pssh=pssh,
-                            raw_pssh=raw_pssh,
+                            pssh=pssh
                         )
                     )
 
