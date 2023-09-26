@@ -71,6 +71,7 @@ module_information = ModuleInformation(  # Only service_name and module_supporte
         "prefer_spatial_mha1": False,
         "prefer_spatial_ac4": False,
         "prefer_aria2c": False,
+        "trim_track_by_sample_rate": True,
         "max_track_quality_to_use": "",
     },
     global_storage_variables=[],
@@ -192,12 +193,13 @@ class ModuleInterface:
                     media_type=DownloadTypeEnum.track, media_id=query.split("=")[1]
                 )
 
-        components = url.path.split("/")
+        components = [item.strip("\\") for item in url.path.split("/") if item]
 
         # use the same logic as orpheusdl cuz lazy
         url_constants = {
             "albums": DownloadTypeEnum.album,
-            # "playlists": DownloadTypeEnum.playlist,  # TODO
+            "playlists": DownloadTypeEnum.playlist,
+            "user-playlists": DownloadTypeEnum.playlist,
             "artists": DownloadTypeEnum.artist,
         }
 
@@ -206,11 +208,17 @@ class ModuleInterface:
             for url_check, media_type in url_constants.items()
             if url_check in components
         ]
-
-        return MediaIdentification(
-            media_type=type_matches[-1],
-            media_id=components[-1] if type_matches[-1] == "albums" else components[2],
-        )
+        
+        if len(components) > 2:
+            return MediaIdentification(
+                media_type=type_matches[-1],
+                media_id=components[1] if type_matches[-1] is DownloadTypeEnum.artist else components[2], # my/playlists/uuid
+            )
+        else:
+            return MediaIdentification(
+                media_type=type_matches[-1],
+                media_id=components[-1],
+            )
 
     def get_track_info(
         self,
@@ -368,9 +376,10 @@ class ModuleInterface:
                     re.split("_| ", str(search_data.get("primaryGenre", "")))
                 ).title()
             }
-            if album_data["productDetails"]["primaryGenreName"] not in genres:
+            prim_album_genre = re.split(r"/", album_data["productDetails"]["primaryGenreName"], maxsplit=1)[0]
+            if prim_album_genre and prim_album_genre not in genres:
                 # this genre name tends to be broad
-                genres.add(album_data["productDetails"]["primaryGenreName"])
+                genres.add(prim_album_genre)
 
             tags = Tags(
                 album_artist=album_data["primaryArtistName"],
@@ -502,12 +511,23 @@ class ModuleInterface:
             final_decrypted_track_location = (
                 f"{create_temp_filename()}.{selected_codec_data.container.name}"
             )
-            ffmpeg.input(decrypted_track_location).output(
-                final_decrypted_track_location,
-                loglevel="warning",
-                audio_bitrate=f"{audio_track.bitrate}k",
-                af=f"atrim=start_sample={audio_track.sample_rate * 6.5}"
-            ).run()
+            
+            ffcmd: ffmpeg = ffmpeg.input(decrypted_track_location) # type: ignore
+            ffcmd_out_kwargs = {
+                "filename": final_decrypted_track_location,
+                "loglevel": "warning",
+                "audio_bitrate": f"{audio_track.bitrate}k",
+            }      
+            if self.settings["trim_track_by_sample_rate"]:
+                ffcmd_out_kwargs.update(
+                    {
+                        "af": f"atrim=start_sample={audio_track.sample_rate * 6.5}"
+                    }
+                )
+
+            ffcmd = ffcmd.output(**ffcmd_out_kwargs)
+            ffcmd.run()
+            
             silentremove(decrypted_track_location)
 
         # except Exception as e:
@@ -615,24 +635,32 @@ class ModuleInterface:
     ) -> (
         PlaylistInfo
     ):  # Mandatory if either ModuleModes.download or ModuleModes.playlist
-        raise NotImplementedError
-        playlist_data = (
+        p_data = (
             data[playlist_id]
             if playlist_id in data
-            else self.mobile_session.get_playlist(playlist_id)
+            else {}
         )
+        if not p_data:
+            if len(playlist_id) == 10:
+                # An ASIN
+                p_data = self.mobile_session.get_catalog_playlist(playlist_id)['playlist']
+            else:
+                # A user playlist (either from the shared link, or the address bar)
+                p_data = self.mobile_session.get_user_playlist(playlist_id)["playlists"][0]
+        
+        p_data = dict(p_data)
 
         return PlaylistInfo(
-            name="",
-            creator="",
-            tracks=[],
-            release_year="",
-            explicit=False,
-            creator_id="",  # optional
-            cover_url="",  # optional
+            name=p_data["metadata"]["title"],
+            creator=p_data.get("metadata", {}).get("curatedBy", ""),
+            tracks=[track["metadata"]["asin"] for track in p_data.get("tracks", [])],
+            release_year=0,
+            duration=p_data["metadata"]["durationSeconds"],
+            explicit=p_data.get("metadata", {}).get("parentalControls", {}).get("hasExplicitLanguage", False),
+            creator_id=p_data.get("metadata", {}).get("profileId"),  # optional
+            cover_url=p_data["metadata"]["fourSquareArt"]["url"],  # optional
             cover_type=ImageFileTypeEnum.jpg,  # optional
-            animated_cover_url="",  # optional
-            description="",  # optional
+            description=p_data.get("metadata", {}).get("description"),  # optional
             track_extra_kwargs={"data": ""},  # optional, whatever you want
         )
 
@@ -861,7 +889,7 @@ class ModuleInterface:
                 limit=100,
             )
          
-        cover_url = str(search_data.get("artOriginal", {}).get("artUrl", ""))
+        cover_url = str(search_data.get("artOriginal", {}).get("artUrl", search_data.get("metadata", {}).get("albumArt", {}).get("url", "")))
 
         if not cover_url:
             # These types of album/tracks are unique as they only appear in Playlists (curated by Amazon Music)
@@ -873,7 +901,7 @@ class ModuleInterface:
                 search_types=("catalog_playlist",),
                 limit=100,
             ):
-                p_data = self.mobile_session.get_playlist(p_search_data["seriesAsin"])
+                p_data = self.mobile_session.get_catalog_playlist(p_search_data["seriesAsin"])
                 for track in p_data.get("playlist", {}).get("tracks", []):
                     if track.get("metadata", {}).get("albumAsin") not in asins:
                         continue

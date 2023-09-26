@@ -160,9 +160,10 @@ class AmazonMusicMobileAPI:
 
         code_verifier = create_code_verifier()
 
+        marketplace_id = cls.get_marketplace_id(country_code) or cls._get_web_client_configuration(domain).marketplace_id
         oauth_url, serial = cls._build_oauth_url(
             domain="com",
-            market_place_id=cls.get_marketplace_id(country_code),
+            market_place_id=marketplace_id,
             code_verifier=code_verifier,
             application=application,
             serial=serial,
@@ -623,7 +624,7 @@ class AmazonMusicMobileAPI:
         )
         return dict(resp.json())
 
-    def get_playlist(self, asin: str):
+    def get_catalog_playlist(self, asin: str):
         """
         Get a playlist and its tracks.
 
@@ -650,6 +651,109 @@ class AmazonMusicMobileAPI:
             },
         )
         return dict(resp.json())
+    
+    def get_user_playlist(self, playlist_uuid: str):
+        """
+        Get a playlist and its tracks.
+
+        Args:
+            asin: A valid ASIN.
+        """
+
+        resp = self.post(
+            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/playlists/",
+            headers={
+                "x-amz-target": "com.amazon.musicplaylist.model.MusicPlaylistService.getPlaylistsByIdV2",
+                "User-Agent": self.APP_USER_AGENT,
+                "x-amzn-requestid": str(uuid.uuid4()).lower(),
+            },
+            data={
+                "contentEncoding": True,
+                "customerInfo": {
+                    "customerId": "",
+                    "deviceId": self.credentials.device_info["device_serial_number"],
+                    "deviceType": AmazonMobileApplication.MUSIC.device_type,
+                },
+                "featureSet": [
+                    "SUPPORT_MIXED_ID_TYPES",
+                    "INCLUDE_FOLLOWER_COUNT"
+                ],
+                "playlistIds": [
+                    playlist_uuid
+                ],
+                "requestedMetadata": [
+                    "albumArtistAsin",
+                    "albumArtistName",
+                    "albumAsin",
+                    "albumContributors",
+                    "albumCoverImageFull",
+                    "albumCoverImageLarge",
+                    "albumCoverImageMedium",
+                    "albumCoverImageSmall",
+                    "albumCoverImageTiny",
+                    "albumCoverImageXL",
+                    "albumName",
+                    "albumPrimaryGenre",
+                    "albumRating",
+                    "albumReleaseDate",
+                    "artistAsin",
+                    "artistName",
+                    "asin",
+                    "assetType",
+                    "assetEligibility",
+                    "audioUpgradeDate",
+                    "bitrate",
+                    "composer",
+                    "contributors",
+                    "creationDate",
+                    "customMeta",
+                    "discNum",
+                    "dmid",
+                    "duration",
+                    "eligibility",
+                    "fileExtension",
+                    "fullAlbumPurchased",
+                    "gracenoteId",
+                    "instantImport",
+                    "isMusicSubscription",
+                    "internalTags",
+                    "lastUpdatedDate",
+                    "localFilePath",
+                    "lyricist",
+                    "marketplace",
+                    "matchType",
+                    "matchVersion",
+                    "md5",
+                    "fileName",
+                    "objectId",
+                    "orderId",
+                    "parentalControls",
+                    "performer",
+                    "physicalOrderId",
+                    "primaryGenre",
+                    "primeStatus",
+                    "publisher",
+                    "purchased",
+                    "purchaseDate",
+                    "rating",
+                    "rogueBackfillDate",
+                    "fileSize",
+                    "songWriter",
+                    "sortAlbumArtistName",
+                    "sortAlbumName",
+                    "sortArtistName",
+                    "sortTitle",
+                    "status",
+                    "storageLocation",
+                    "title",
+                    "trackNum",
+                    "errorCode",
+                    "uploaded"
+                ]
+            }
+        )
+        return dict(resp.json())
+    
 
     def get_recent_tracks(self):
         """
@@ -1818,17 +1922,18 @@ class AmazonMusicMobileAPI:
         )
 
     @staticmethod
-    def get_marketplace_id(country_code: str) -> str:
+    def get_marketplace_id(country_code: str):
         """Returns the marketplace id for a given country code"""
         # NOTE: this can be retrived by parsing the appConfig from the root on the netloc
         # marketplace ID for amazon prime video japan: ART4WZ8MWBX2Y
-        return {
+        ids = {
             "US": "ATVPDKIKX0DER",
             "JP": "A1VC38T7YXB528",
             "GB": "A1F83G8C2ARO7P",
             "AU": "A39IBJ37TRP1C6",
             "NZ": "A39IBJ37TRP1C6",
-        }[country_code.upper()]
+        }
+        return ids.get(country_code.upper())
 
 
 # bruh
