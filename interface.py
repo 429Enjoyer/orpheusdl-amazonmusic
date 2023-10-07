@@ -26,7 +26,7 @@ from xml.etree import ElementTree
 
 
 from utils.models import *
-from utils.utils import create_temp_filename, download_file, download_to_temp, silentremove
+from utils.utils import create_temp_filename, download_file, download_to_temp, silentremove, sanitise_name
 
 from .azapi import AmazonMusicMobileAPI, AmazonMusicMobileAPICredentials
 
@@ -57,8 +57,8 @@ module_information = ModuleInformation(  # Only service_name and module_supporte
     service_name="Amazon Music",
     module_supported_modes=ModuleModes.download
     | ModuleModes.lyrics
-    | ModuleModes.covers,
-    # | ModuleModes.credits,
+    | ModuleModes.covers
+    | ModuleModes.credits,
     # flags = ModuleFlags.hidden,
     # Flags:
     # startup_load: load module on startup
@@ -380,7 +380,7 @@ class ModuleInterface:
             if prim_album_genre and prim_album_genre not in genres:
                 # this genre name tends to be broad
                 genres.add(prim_album_genre)
-
+            
             tags = Tags(
                 album_artist=album_data["primaryArtistName"],
                 composer=composers,
@@ -417,9 +417,9 @@ class ModuleInterface:
                 )
 
             return TrackInfo(
-                name=self.sanitize_meta_name(track_data["title"]) if track_data["parentalControls"]["hasExplicitLanguage"] else track_data["title"],
+                name=self.sanitize_meta_name(track_data["title"]),
                 album_id=album_id,
-                album=self.sanitize_meta_name(track_data["album"]["title"]) if track_data["parentalControls"]["hasExplicitLanguage"] else track_data["album"]["title"],
+                album=self.sanitize_meta_name(track_data["album"]["title"]),
                 artists=artists,
                 tags=tags,
                 codec=track_to_use.codec,
@@ -492,7 +492,7 @@ class ModuleInterface:
             if not os.path.exists(decrypted_track_location):
                 raise FileNotFoundError("Unable to decrypt the downloaded media file")
 
-            LOGGER.debug("Ok wth decryption")
+            LOGGER.debug("Ok with decryption")
 
             silentremove(encrypted_track_location)
 
@@ -570,6 +570,7 @@ class ModuleInterface:
             )
 
         # album_data = self.mobile_session.get_album_info(album_id, use_alternative_naming=True)
+        # pprint.pprint(self.mobile_session.get_page(f"album/{album_id}"))
 
         mapped_tracks = {
             f"{asin}_quality_mapping": self.mpd_to_quality_map(mpd, asin)
@@ -608,10 +609,9 @@ class ModuleInterface:
                 )
             )
         explicit = any(track["parentalControls"]["hasExplicitLanguage"] for track in album_data.get("tracks", []))
-
         return AlbumInfo(
             # name=album_data.get("title", "Unknown name"),
-            name=self.sanitize_meta_name(album_data.get("title", "Unknown")) if explicit else album_data.get("title", "Unknown"),
+            name=self.sanitize_meta_name(album_data.get("title", "Unknown")),
             artist=album_data.get("primaryArtistName", ""),
             tracks=[track["asin"] for track in album_data.get("tracks", [])],
             release_year=int(self._get_date_from_metadata(album_data).strftime("%Y")),
@@ -624,7 +624,7 @@ class ModuleInterface:
             all_track_cover_jpg_url=tracks_cover_art,  # technically optional, but HIGHLY recommended
             animated_cover_url="",  # optional
             description="",  # optional
-            quality=f"{best_audio_track.official_quality_name}] [{codec_data[best_audio_track.codec].pretty_name}",
+            quality=f"{best_audio_track.official_quality_name} {codec_data[best_audio_track.codec].pretty_name}",
             track_extra_kwargs={
                 "data": track_extra_kwargs
             },  # optional, whatever you want
@@ -640,6 +640,7 @@ class ModuleInterface:
             if playlist_id in data
             else {}
         )
+
         if not p_data:
             if len(playlist_id) == 10:
                 # An ASIN
@@ -741,15 +742,9 @@ class ModuleInterface:
     def get_track_credits(
         self, track_id: str, data={}
     ):  # Mandatory if ModuleModes.credits
-        raise NotImplementedError
-        track_data = (
-            data[track_id]
-            if track_id in data
-            else self.mobile_session.get_track(track_id)
-        )
-        credits = track_data["credits"]
-        credits_dict = {}
-        return [CreditsInfo(k, v) for k, v in credits_dict.items()]
+        track_credits = self.mobile_session.get_track_xray(track_id, parse_credits=True)
+        LOGGER.debug("Credits: %s", track_credits)
+        return [CreditsInfo(sanitise_name(k), v) for k, v in track_credits.items()]
 
     def get_track_cover(
         self, track_id: str, cover_options: CoverOptions, data={}
@@ -819,11 +814,11 @@ class ModuleInterface:
         results = []
         search_type = f"catalog_{query_type.name}"
         # if track_info and track_info.tags.isrc:
-        #     results = list(self.mobile_session.get_documents_from_search_results(
+        #     results = list(
         #         self.mobile_session.search(
-        #             search_type, track_info.tags.isrc, limit
+        #             query=track_info.tags.isrc, search_types=(search_type,), limit=limit
         #         )
-        #     ))
+        #     )
         if not results:
             results = list(
                 self.mobile_session.search(
@@ -934,8 +929,11 @@ class ModuleInterface:
     
     @staticmethod
     def sanitize_meta_name(name: str):
-        return name.rsplit(" [Explicit]", maxsplit=1)[0]
-    
+        sanitized = re.split(r"(\s\[Explicit\]|\s\[Clean\])$", name, maxsplit=1)
+        if len(sanitized) >= 2:
+            return sanitized[0]
+        # No matches found
+        return name
     
     @staticmethod
     def format_cover_url(url: str, options: CoverOptions):
@@ -1174,9 +1172,9 @@ class ModuleInterface:
 
         for period in manifest.findall("Period"):
             for adaptation_set in period.findall("AdaptationSet"):
-                content_type = adaptation_set.get("contentType")
-                if content_type != "audio":
-                    raise ValueError("Only supports audio MPDs!")
+                # content_type = adaptation_set.get("contentType")
+                # if content_type != "audio":
+                #     raise ValueError("Only supports audio MPDs!")
 
                 pssh = None
 
@@ -1199,6 +1197,7 @@ class ModuleInterface:
                     # continue
                     raise ValueError("Failed to find PSSH.")
 
+                official_quality_name: str | None = None
                 supplemental_properties = adaptation_set.findall("SupplementalProperty")
                 for prop in supplemental_properties:
                     if prop.get("schemeIdUri") != "amz-music:trackType":
@@ -1206,11 +1205,6 @@ class ModuleInterface:
                     official_quality_name = prop.get("value", "Unknown")
                     LOGGER.debug(f"Official name for track: {official_quality_name}")
                     break
-                else:
-                    # impossible unless amazon changes their backend (never)
-                    raise RuntimeError(
-                        [item.attrib for item in supplemental_properties]
-                    )
 
                 for representation in adaptation_set.findall("Representation"):
                     media_url_elem = representation.find("BaseURL")
@@ -1228,6 +1222,8 @@ class ModuleInterface:
                         # amz-music:trackType only returns the following:
                         # LD, SD, HD, and 3D
                         official_quality_name = "UHD"
+                    elif official_quality_name is None:
+                        official_quality_name = quality
 
                     codec = str(representation.get("codecs")).upper()
                     # 360 Audio
@@ -1240,6 +1236,9 @@ class ModuleInterface:
                         codec = "EAC3"
                     elif codec.startswith("AC-4"):
                         codec = "AC4"
+                    # V2 musicDashVersionList
+                    elif codec.startswith("MP4A"):
+                        codec = "AAC"
 
                     codec = CodecEnum[codec]
 

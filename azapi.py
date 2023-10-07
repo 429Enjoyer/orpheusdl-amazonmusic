@@ -253,17 +253,19 @@ class AmazonMusicMobileAPI:
                 resp = session.send(request)
                 resp.raise_for_status()
             except httpx.HTTPError as ce:
-                time.sleep(10)
                 LOGGER.error(ce)
+                if resp:
+                    LOGGER.error(resp.content)
                 LOGGER.debug(ce, exc_info=True)
                 last_http_exc = ce
+                time.sleep(10)
                 continue
             else:
                 # return the response when successful
                 return resp
         else:
             if resp:
-                LOGGER.error(resp.text)
+                LOGGER.error("%s, %s", resp.text, resp.content)
             raise last_http_exc or RuntimeError()
 
     def post(
@@ -271,19 +273,22 @@ class AmazonMusicMobileAPI:
         url: str,
         data: dict | None,
         headers: typing.Optional[dict] = None,
+        add_default_stratus_headers: typing.Optional[bool] = True,
         sign: typing.Optional[bool] = True,
     ) -> httpx.Response:
         # these headers assume that the url is https://music.amazon.com/NA/api/stratus/
         # TODO have a enum representing the the api endpoints for the different headers
-        headers = {
-            "User-Agent": self.APP_USER_AGENT,
-            "android-app-version": self.application_version,
-            "content-encoding": "amz-1.0",
-            "accept": "application/json",
-            "accept-encoding": "gzip",
-            "accept-charset": "utf-8",
-            "content-type": "application/json; charset=UTF-8",
-        } | (headers or {})
+        if add_default_stratus_headers:
+            headers = {
+                "User-Agent": self.APP_USER_AGENT,
+                "android-app-version": self.application_version,
+                "content-encoding": "amz-1.0",
+                "accept": "application/json",
+                "accept-encoding": "gzip",
+                "accept-charset": "utf-8",
+                "content-type": "application/json; charset=UTF-8",
+            } | (headers or {})
+
         request = httpx.Request(
             "POST",
             url,
@@ -392,6 +397,7 @@ class AmazonMusicMobileAPI:
                 "filters": None,
                 "lang": self.credentials.web_client_config.locale,  # the lang locale of the phone/mobile app, en_US
                 "marketplaceId": None,
+                "debug": True,
                 "metadataLang": "en"
                 if use_alternative_naming
                 else None,  # null for locale based on IP, setting to a random string value returns it romanized
@@ -405,12 +411,87 @@ class AmazonMusicMobileAPI:
         )
         if response.status_code != 200:
             raise Exception(
-                f"Failed to get track manifest: {response.status_code} {response.text}"
+                f"Failed to get track metadata: {response.status_code} {response.text}"
             )
         resp_json = response.json()
 
         LOGGER.debug(json.dumps(resp_json, indent=2))
         return resp_json
+    
+    def get_page(
+        self,
+        uri: str,
+        count: typing.Optional[int] = None,
+        locale: typing.Optional[str] = None,
+    ):
+        """
+        Get a page of a Amazon Music URI.
+
+        Args:
+            uri: str: A valid Amazon Music URI.
+            count: int: How many related albums you want to obtain?
+            I have no idea what the `count` paramter means.
+
+        Example usage:
+
+        `self.mobile_session.get_page("album/B0CDJC65LH", count=0, locale="en_US")
+        """
+        if not locale:
+            locale = self.credentials.web_client_config.locale
+        if not count:
+            count = 5
+        # Content features can be any of the following:
+        # 'contentFeatures' failed to satisfy constraint: Member must satisfy constraint: [Member must satisfy enum value set: [requestFeaturedPlayV4Sub1, podcastSonicRush, pinPodcastsInFacetedNavigation, requestFeaturedPlayV6NoPodcasts, includeFacetedNavigation, personalizedPlaylist, includeVideoStory, includePodcastCuratedContent, podcast, includePodcastExploreBites, populateRecentlyPlayed, includeLiveEvent, includeVideoStoryOnArtistHighlights, allowDeepLinkURLInWidget, includeAlbumDetailUpsellWidgets, requestFeaturedPlayV2, requestFeaturedPlayV3, bundesliga, artistTasteCollection, requestFeaturedPlayV4, includePodcastBitesVisualShoveler, requestFeaturedPlayV5, includeVideoShow, includeCommentary, requestFeaturedPlayV6, requestFeaturedPlay, includePodcastUserContent, includeVideo, audioShow, includeLiveStream, includeFollowArtistsWidget, includeMerch, includeStationFromAnything, editorialAssociations, includeUpsellWidgets, includeAmpShows, recentlyPlayed, allowVerticalItemBarkers, includeCommentaryFlag, includePodcastEpisodeDescriptiveShoveler]]
+
+        resp = self.post(
+            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/musepage/",
+            headers={
+                "x-amz-target": "com.amazon.musicensembleservice.MusicEnsembleService.page",
+                "User-Agent": self.APP_USER_AGENT,
+                "X-Amz-Requestid": str(uuid.uuid4()).lower(),
+            },
+            data={
+                "allowedParentalControls": {"hasExplicitLanguage": True},
+                "allowedParentalControlsString": None,
+                "artistVideoStoryEntityAsin": None,
+                "browseId": None,
+                "campaignsXml": None,
+                "contentFeatures": [
+                    "includeVideo",
+                    "includeVideoStory",
+                    "allowDeepLinkURLInWidget",
+                    "podcast",
+                    "includePodcastCuratedContent",
+                    "includePodcastUserContent",
+                    "includePodcastEpisodeDescriptiveShoveler",
+                    "podcastSonicRush",
+                    "includeLiveStream",
+                ],
+                "count": count,
+                "countOfEntitiesPerWidget": None,
+                "customerIP": None,
+                "customerId": None,
+                "debug": None,  # set for True for.. a new errors attribute.
+                "deviceId": self.credentials.device_info["device_serial_number"],
+                "deviceType": AmazonMobileApplication.MUSIC.device_type,
+                "ipAddress": None,
+                "languagesOfPerformance": None,
+                "locale": locale,  # "ja_JP"
+                "marketplaceId": None,
+                "musicRequestIdentityContextToken": None,
+                "musicTerritory": self.credentials.web_client_config.music_territory,
+                "nextToken": None,
+                "offset": None,
+                "requestedContent": "KATANA",
+                "sessionId": None,
+                "stub": False,
+                "testTraffic": None,
+                "upsellContent": None,
+                "uri": uri,  # e.g "album/B0CDJC65LH"
+                "validationPayload": None,
+            },
+        )
+        return dict(resp.json())
 
     @typing.overload
     def search(
@@ -549,80 +630,28 @@ class AmazonMusicMobileAPI:
         else:
             return {}
 
-    def get_page(
-        self,
-        uri: str,
-        count: typing.Optional[int] = None,
-        locale: typing.Optional[str] = None,
-    ):
+    def find_item_by_asin_in_search_results(self, results: dict, asin: str):
         """
-        Get a page of a Amazon Music URI.
-
-        Args:
-            uri: str: A valid Amazon Music URI.
-            count: int: How many related albums you want to obtain?
-            I have no idea what the `count` paramter means.
-
-        Example usage:
-
-        `self.mobile_session.get_page("album/B0CDJC65LH", count=0, locale="en_US")
+        Comedically long function name
         """
-        if not locale:
-            locale = self.credentials.web_client_config.locale
-        if not count:
-            count = 5
-        # Content features can be any of the following:
-        # 'contentFeatures' failed to satisfy constraint: Member must satisfy constraint: [Member must satisfy enum value set: [requestFeaturedPlayV4Sub1, podcastSonicRush, pinPodcastsInFacetedNavigation, requestFeaturedPlayV6NoPodcasts, includeFacetedNavigation, personalizedPlaylist, includeVideoStory, includePodcastCuratedContent, podcast, includePodcastExploreBites, populateRecentlyPlayed, includeLiveEvent, includeVideoStoryOnArtistHighlights, allowDeepLinkURLInWidget, includeAlbumDetailUpsellWidgets, requestFeaturedPlayV2, requestFeaturedPlayV3, bundesliga, artistTasteCollection, requestFeaturedPlayV4, includePodcastBitesVisualShoveler, requestFeaturedPlayV5, includeVideoShow, includeCommentary, requestFeaturedPlayV6, requestFeaturedPlay, includePodcastUserContent, includeVideo, audioShow, includeLiveStream, includeFollowArtistsWidget, includeMerch, includeStationFromAnything, editorialAssociations, includeUpsellWidgets, includeAmpShows, recentlyPlayed, allowVerticalItemBarkers, includeCommentaryFlag, includePodcastEpisodeDescriptiveShoveler]]
+        for document in self.get_documents_from_search_results(results):
+            avaliable_asins = [
+                str(document.get(item))
+                for item in ("albumAsin", "artistAsin", "asin", "seriesAsin")
+                if document.get(item)
+            ]
+            if asin not in avaliable_asins:
+                continue
+            return document
+        return
 
-        resp = self.post(
-            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/musepage/",
-            headers={
-                "x-amz-target": "com.amazon.musicensembleservice.MusicEnsembleService.page",
-                "User-Agent": self.APP_USER_AGENT,
-                "X-Amz-Requestid": str(uuid.uuid4()).lower(),
-            },
-            data={
-                "allowedParentalControls": {"hasExplicitLanguage": True},
-                "allowedParentalControlsString": None,
-                "artistVideoStoryEntityAsin": None,
-                "browseId": None,
-                "campaignsXml": None,
-                "contentFeatures": [
-                    "includeVideo",
-                    "includeVideoStory",
-                    "allowDeepLinkURLInWidget",
-                    "podcast",
-                    "includePodcastCuratedContent",
-                    "includePodcastUserContent",
-                    "includePodcastEpisodeDescriptiveShoveler",
-                    "podcastSonicRush",
-                    "includeLiveStream",
-                ],
-                "count": count,
-                "countOfEntitiesPerWidget": None,
-                "customerIP": None,
-                "customerId": None,
-                "debug": None,  # set for True for.. a new errors attribute.
-                "deviceId": self.credentials.device_info["device_serial_number"],
-                "deviceType": AmazonMobileApplication.MUSIC.device_type,
-                "ipAddress": None,
-                "languagesOfPerformance": None,
-                "locale": locale,  # "ja_JP"
-                "marketplaceId": None,
-                "musicRequestIdentityContextToken": None,
-                "musicTerritory": self.credentials.web_client_config.music_territory,
-                "nextToken": None,
-                "offset": None,
-                "requestedContent": "KATANA",
-                "sessionId": None,
-                "stub": False,
-                "testTraffic": None,
-                "upsellContent": None,
-                "uri": uri,  # e.g "album/B0CDJC65LH"
-                "validationPayload": None,
-            },
-        )
-        return dict(resp.json())
+    @staticmethod
+    def get_documents_from_search_results(results: dict):
+        for category in results:
+            if int(category["totalHitCount"]) == 0:
+                continue
+            for hit in category["hits"]:
+                yield dict(hit["document"])
 
     def get_catalog_playlist(self, asin: str):
         """
@@ -920,10 +949,19 @@ class AmazonMusicMobileAPI:
                     "deviceTypeId": AmazonMobileApplication.MUSIC.device_type,
                 },
                 "musicDashVersionList": [
-                    # "SIREN", #untested
+                    # "SIREN", # assuming that its used for free and prime subscription tiers 
                     "SIREN_KATANA",  # with 360 audio, but keeps on getting invalid key size (with group_pssh)? PSSH Entitled key size is always 32 bytes, not sure why (brings error if used)
                     # "SIREN_KATANA_NO_CLEAR_LEAD", #this and no entitlement, is what is used by Amazon Music Web
+                    # "V2", # for obtaining legacy AAC audio
+                    # "V1", # not working
                 ],
+                # only if musicDashVersionList is "V2"
+                # "bitrateTypeList": [
+                #     "HIGH",
+                #     "MEDIUM",
+                #     "LOW",
+                # ],
+
                 # Sometimes having tryAsinSubstitution set to true
                 # but no try3dAsinSubstitution
                 # fails to get 360RA audio (3-6) for these albums:
@@ -936,7 +974,7 @@ class AmazonMusicMobileAPI:
             },
         )
         resp_dict = response.json()
-        # print(resp_dict)
+
         if (
             response.status_code != 200
             or resp_dict["contentResponseList"][0]["contentResponseStatusCode"]
@@ -1029,9 +1067,10 @@ class AmazonMusicMobileAPI:
             raise ValueError(f"Failed to get artist metadata. {resp}")
         return resp[0]
 
-    def get_artist_page(self, asin: str):
+    def get_track_xray(self, asin: str, parse_credits: typing.Optional[bool] = False):
         response = self.post(
-            url=f"https://{str(self.credentials.web_client_config.region).lower()}.mobilemesk.skill.music.a2z.com/api/showCatalogArtist",
+            url=f"https://{str(self.credentials.web_client_config.region).lower()}.mobilemesk.skill.music.a2z.com/api/showXray/{asin}",
+            add_default_stratus_headers=False,
             headers={
                 "x-amzn-device-id": self.credentials.device_info[
                     "device_serial_number"
@@ -1043,7 +1082,7 @@ class AmazonMusicMobileAPI:
                 "x-amzn-device-height": "2560",
                 "x-amzn-device-width": "1440",
                 "x-amzn-device-scale": "3.5",
-                "x-amzn-application-version": "23.7.0",
+                "x-amzn-application-version": self.application_version,
                 "x-amzn-os-version": "11",
                 "x-amzn-device-time-zone": "America/Toronto",
                 "x-amzn-timestamp": f"{time.time_ns() // 1_000_000}",
@@ -1057,43 +1096,81 @@ class AmazonMusicMobileAPI:
                     }
                 ),
                 "x-amzn-session-id": self.credentials.website_cookies["session-id"],
-                "x-amzn-feature-flags": "includeArtistRefinements",
+                # "x-amzn-feature-flags": "includeArtistRefinements",
                 "content-type": "application/json; charset=utf-8",
                 "accept-encoding": "gzip",
                 "user-agent": "okhttp/4.10.0",
             },
             data={
-                "id": asin,
+                # "id": asin,
+                "assetType": "AUDIO",
+                "swipeablePageConfig": json.dumps(
+                    {
+                        "interface": "Touch.SwipeablePagesTemplateInterface.v1_0.SwipeablePagesClientInformation",
+                        "isChartsV3Enabled": True,
+                        "isStageEnabled": False
+                    }
+                )
             },
         )
-        # "libraryArtistId": "-1"
-        LOGGER.debug(json.dumps(response.json(), indent=3))
-        # print(json.dumps(response.json(), indent=3))
 
-        return response.json()
+        # LOGGER.debug(json.dumps(response.json(), indent=3))
+        
+        resp_dict = response.json()
 
-    def find_item_by_asin_in_search_results(self, results: dict, asin: str):
-        """
-        Comedically long function name
-        """
-        for document in self.get_documents_from_search_results(results):
-            avaliable_asins = [
-                str(document.get(item))
-                for item in ("albumAsin", "artistAsin", "asin", "seriesAsin")
-                if document.get(item)
-            ]
-            if asin not in avaliable_asins:
-                continue
-            return document
-        return
+        if parse_credits:
+            return self.parse_credits_from_xray(resp_dict)
 
+        return resp_dict
+    
     @staticmethod
-    def get_documents_from_search_results(results: dict):
-        for category in results:
-            if int(category["totalHitCount"]) == 0:
+    def proper_credits_names():
+        """ Some credit names are not formatted correctly, this can be used to fix them. """
+        return {
+            "Performed by": "Performer",
+            "Written by": "Lyricist",
+            "Produced by": "Producer",
+        }
+    
+    @staticmethod
+    def parse_credits_from_xray(response: dict):
+        credits_mapping: dict[str, list[str]] = {}
+        for method in response.get("methods", []):
+            if not str(method.get("interface", "")).endswith("CreateAndBindManagedContainerMethod"):
+                # print("not CreateAndBindManagedContainerMethod")
                 continue
-            for hit in category["hits"]:
-                yield dict(hit["document"])
+            for page in method.get("template", {}).get("pages", []):
+                if not str(page.get("interface", "")).endswith("ScrollableListElement"):
+                    # print("not ScrollableListElement")
+                    continue
+                if str(page.get("label", {}).get("title")) != "CREDITS":
+                    # print("label title not CREDITS")
+                    continue
+                
+                for page_element in page.get("elements", []):
+                    if not str(page_element.get("interface", "")).endswith("VerticalContainerElement"):
+                        continue
+                    credit_name: str = ""
+                    person_name: str = ""
+                    
+                    for container_element in page_element.get("elements", []):
+                        if str(container_element.get("interface", "")).endswith("LabelElement"):
+                           credit_name = AmazonMusicMobileAPI.proper_credits_names().get(
+                               container_element["text"],
+                               str(container_element["text"]).title()
+                            )
+
+                        if str(container_element.get("interface", "")).endswith("ClickableTextElement"):
+                            person_name = container_element["text"]
+                    
+                    if not credit_name and person_name:
+                        continue
+                    
+                    names = credits_mapping.get(credit_name, [])
+                    names.append(person_name)
+                    credits_mapping.update({credit_name: names})
+                    
+        return credits_mapping
 
     @staticmethod
     def parse_from_content_responses(content_responses: list[dict[str, typing.Any]]):
