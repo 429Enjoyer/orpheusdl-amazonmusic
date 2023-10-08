@@ -45,13 +45,15 @@ class AudioTrack:
     quality_ranking: int
     pssh: PSSH
     # pssh: typing.Any
+    reference_loudness: str
+    """ e.g 7.2 LUFS """
     bit_depth: Optional[int] = None
 
     def to_dict(self):
         return dataclasses.asdict(self)
 
 
-# This is a Amazon Music module for OrpheusDL, require an active unlimited subscription
+# This is a Amazon Music module for OrpheusDL, requires an active unlimited subscription
 
 module_information = ModuleInformation(  # Only service_name and module_supported_modes are mandatory
     service_name="Amazon Music",
@@ -354,7 +356,9 @@ class ModuleInterface:
             extra_tags = {
                 "Composer": composers,  # force set the composer tag, because orpheus doesn't handle it
                 "WWW": url,
+                "REPLAYGAIN_REFERENCE_LOUDNESS": track_to_use.reference_loudness # ref. https://wiki.hydrogenaud.io/index.php?title=ReplayGain_2.0_specification
             }
+
             if merchant_name := album_data.get("productDetails", {}).get(
                 "merchantName"
             ):
@@ -1198,13 +1202,20 @@ class ModuleInterface:
                     raise ValueError("Failed to find PSSH.")
 
                 official_quality_name: str | None = None
+                audio_ref_loudness: str | None = None
                 supplemental_properties = adaptation_set.findall("SupplementalProperty")
                 for prop in supplemental_properties:
-                    if prop.get("schemeIdUri") != "amz-music:trackType":
+                    # print(prop.get("schemeIdUri"))
+                    if prop.get("schemeIdUri") == "amz-music:trackType":
+                        official_quality_name = prop.get("value", "Unknown")
+                        LOGGER.debug(f"Official name for track: {official_quality_name}")
                         continue
-                    official_quality_name = prop.get("value", "Unknown")
-                    LOGGER.debug(f"Official name for track: {official_quality_name}")
-                    break
+                    if prop.get("schemeIdUri") == "urn:mpeg:mpegB:cicp:ProgramLoudness":
+                        audio_ref_loudness = prop.get("value", "Unknown")
+                        continue
+                
+                if not (official_quality_name and audio_ref_loudness):
+                    raise ValueError("Failed to parse items from SupplementalProperty for AudioTrack")
 
                 for representation in adaptation_set.findall("Representation"):
                     media_url_elem = representation.find("BaseURL")
@@ -1265,7 +1276,8 @@ class ModuleInterface:
                                 representation.get("qualityRanking", 0)
                             ),
                             quality=quality,
-                            pssh=pssh
+                            pssh=pssh,
+                            reference_loudness=audio_ref_loudness
                         )
                     )
 

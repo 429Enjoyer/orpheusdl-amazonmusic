@@ -1127,9 +1127,9 @@ class AmazonMusicMobileAPI:
     def proper_credits_names():
         """ Some credit names are not formatted correctly, this can be used to fix them. """
         return {
-            "Performed by": "Performer",
-            "Written by": "Lyricist",
-            "Produced by": "Producer",
+            "Performed By": "Performer",
+            "Written By": "Lyricist",
+            "Produced By": "Producer",
         }
     
     @staticmethod
@@ -1155,18 +1155,23 @@ class AmazonMusicMobileAPI:
                     
                     for container_element in page_element.get("elements", []):
                         if str(container_element.get("interface", "")).endswith("LabelElement"):
+                           raw_credit_name = str(container_element["text"]).title()
                            credit_name = AmazonMusicMobileAPI.proper_credits_names().get(
-                               container_element["text"],
-                               str(container_element["text"]).title()
+                               raw_credit_name,
+                               raw_credit_name
                             )
 
                         if str(container_element.get("interface", "")).endswith("ClickableTextElement"):
                             person_name = container_element["text"]
                     
-                    if not credit_name and person_name:
+                    if not (credit_name and person_name):
                         continue
                     
                     names = credits_mapping.get(credit_name, [])
+                    
+                    if person_name in names:
+                        continue
+                    
                     names.append(person_name)
                     credits_mapping.update({credit_name: names})
                     
