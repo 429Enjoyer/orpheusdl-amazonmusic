@@ -1151,7 +1151,7 @@ class AmazonMusicMobileAPI:
                     if not str(page_element.get("interface", "")).endswith("VerticalContainerElement"):
                         continue
                     credit_name: str = ""
-                    person_name: str = ""
+                    people_names: list[str] = []
                     
                     for container_element in page_element.get("elements", []):
                         if str(container_element.get("interface", "")).endswith("LabelElement"):
@@ -1162,17 +1162,15 @@ class AmazonMusicMobileAPI:
                             )
 
                         if str(container_element.get("interface", "")).endswith("ClickableTextElement"):
-                            person_name = container_element["text"]
+                            people_names.append(container_element["text"])
                     
-                    if not (credit_name and person_name):
+                    if not (credit_name and people_names):
                         continue
                     
                     names = credits_mapping.get(credit_name, [])
                     
-                    if person_name in names:
-                        continue
-                    
-                    names.append(person_name)
+                    # Remove duplicate names
+                    names = list(set(names + people_names))
                     credits_mapping.update({credit_name: names})
                     
         return credits_mapping
