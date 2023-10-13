@@ -380,7 +380,6 @@ class ModuleInterface:
             # it may not be always avaliable
             # e.g https://music.amazon.co.jp/albums/B09JNRPVHN?trackAsin=B09JNRQQ3P
             genres = self.parse_genres_from_genre(search_data.get("primaryGenre", "")) | self.parse_genres_from_genre(album_data["productDetails"]["primaryGenreName"])
-            print(genres)
             
             tags = Tags(
                 album_artist=album_data["primaryArtistName"],
@@ -992,7 +991,7 @@ class ModuleInterface:
                 unit="B",
                 unit_scale=True,
                 unit_divisor=1024,
-                disable=False,
+                disable=True,
             ) as pbar:
                 while download.is_active:
                     download.update()
