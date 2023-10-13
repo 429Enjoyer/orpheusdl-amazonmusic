@@ -45,8 +45,8 @@ class AudioTrack:
     quality_ranking: int
     pssh: PSSH
     # pssh: typing.Any
-    reference_loudness: str
-    """ e.g 7.2 LUFS """
+    reference_loudness: Optional[str] = None
+    """ e.g 7.2 LUFS, some manifests don't include it """
     bit_depth: Optional[int] = None
 
     def to_dict(self):
@@ -356,7 +356,6 @@ class ModuleInterface:
             extra_tags = {
                 "Composer": composers,  # force set the composer tag, because orpheus doesn't handle it
                 "WWW": url,
-                "REPLAYGAIN_REFERENCE_LOUDNESS": track_to_use.reference_loudness # ref. https://wiki.hydrogenaud.io/index.php?title=ReplayGain_2.0_specification
             }
 
             if merchant_name := album_data.get("productDetails", {}).get(
@@ -371,6 +370,13 @@ class ModuleInterface:
                         )
                     }
                 )
+            if track_to_use.reference_loudness:
+                extra_tags.update(
+                    {
+                        "REPLAYGAIN_REFERENCE_LOUDNESS": track_to_use.reference_loudness # ref. https://wiki.hydrogenaud.io/index.php?title=ReplayGain_2.0_specification
+                    }
+                )
+
             genres = {
                 # sanitize and format the genre name from search data
                 # this genre tends to be more specific however,
@@ -1214,8 +1220,9 @@ class ModuleInterface:
                         audio_ref_loudness = prop.get("value", "Unknown")
                         continue
                 
-                if not (official_quality_name and audio_ref_loudness):
-                    raise ValueError("Failed to parse items from SupplementalProperty for AudioTrack")
+                if not official_quality_name:
+                    # print(f"{official_quality_name}, {audio_ref_loudness}")
+                    raise ValueError("Failed to parse pretty quality name from SupplementalProperty for AudioTrack")
 
                 for representation in adaptation_set.findall("Representation"):
                     media_url_elem = representation.find("BaseURL")

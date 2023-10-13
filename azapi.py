@@ -252,6 +252,7 @@ class AmazonMusicMobileAPI:
                 # print(f"Handling request: {request} at {time.perf_counter()}")
                 resp = session.send(request)
                 resp.raise_for_status()
+                LOGGER.debug("OK with request with status code %s for request %s", resp.status_code, request.url)
             except httpx.HTTPError as ce:
                 LOGGER.error(ce)
                 if resp:
