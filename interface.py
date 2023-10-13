@@ -319,8 +319,9 @@ class ModuleInterface:
             # Attempt to seperate each contributor if they're concatenated
             for artist in artists.copy():
                 if sep_artists := self.parse_credit_names_from_name(artist):
+                    if artist in artists:
+                        artists.remove(artist)
                     artists.extend(sep_artists)
-                    artists.remove(artist)
 
             # Remove duplicates
             # artists = list(set(artists))
@@ -342,8 +343,9 @@ class ModuleInterface:
 
             for name in writers.copy():
                 if names := self.parse_credit_names_from_name(name):
-                    artists.extend(names)
-                    artists.remove(name)
+                    if name in writers:
+                        writers.remove(name)
+                    writers.extend(names)
 
             composers = natsort.natsorted(set(writers))
 
