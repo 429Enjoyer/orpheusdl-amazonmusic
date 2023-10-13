@@ -306,10 +306,11 @@ class ModuleInterface:
             # e.g https://music.amazon.co.jp/albums/B08P688B62
             if len(contributor_asins) > 1:
                 artists.extend(
-                    str(item["name"])
+                    str(item.get("name"))
                     for item in self.mobile_session.get_metadata(contributor_asins)[
                         "artistList"
                     ]
+                    if item.get("name")
                 )
             else:
                 # Fallback, include the formatted artist name (might include contributors)
@@ -317,11 +318,9 @@ class ModuleInterface:
 
             # Attempt to seperate each contributor if they're concatenated
             for artist in artists.copy():
-                artist_sep = {item for item in re.split(r", | & ", artist) if item}
-                if not artist_sep:
-                    continue
-                artists.extend(artist_sep)
-                artists.remove(artist)
+                if sep_artists := self.parse_credit_names_from_name(artist):
+                    artists.extend(sep_artists)
+                    artists.remove(artist)
 
             # Remove duplicates
             # artists = list(set(artists))
@@ -340,12 +339,11 @@ class ModuleInterface:
 
             # Sometimes writers are just one item in a list, seperated with /
             # e.g https://music.amazon.co.jp/albums/B0CG7FWYTK
-            if any(" / " in item for item in writers):
-                for item in writers:
-                    if " / " not in item:
-                        continue
-                    writers.extend(str(item).split(" / "))
-                    writers.remove(item)
+
+            for name in writers.copy():
+                if names := self.parse_credit_names_from_name(name):
+                    artists.extend(names)
+                    artists.remove(name)
 
             composers = natsort.natsorted(set(writers))
 
@@ -377,19 +375,12 @@ class ModuleInterface:
                     }
                 )
 
-            genres = {
-                # sanitize and format the genre name from search data
-                # this genre tends to be more specific however,
-                # it may not be always avaliable
-                # e.g https://music.amazon.co.jp/albums/B09JNRPVHN?trackAsin=B09JNRQQ3P
-                " ".join(
-                    re.split("_| ", str(search_data.get("primaryGenre", "")))
-                ).title()
-            }
-            prim_album_genre = re.split(r"/", album_data["productDetails"]["primaryGenreName"], maxsplit=1)[0]
-            if prim_album_genre and prim_album_genre not in genres:
-                # this genre name tends to be broad
-                genres.add(prim_album_genre)
+            # sanitize and format the genre name from search data
+            # this genre tends to be more specific however,
+            # it may not be always avaliable
+            # e.g https://music.amazon.co.jp/albums/B09JNRPVHN?trackAsin=B09JNRQQ3P
+            genres = self.parse_genres_from_genre(search_data.get("primaryGenre", "")) | self.parse_genres_from_genre(album_data["productDetails"]["primaryGenreName"])
+            print(genres)
             
             tags = Tags(
                 album_artist=album_data["primaryArtistName"],
@@ -427,9 +418,9 @@ class ModuleInterface:
                 )
 
             return TrackInfo(
-                name=self.sanitize_meta_name(track_data["title"]),
+                name=self.sanitize_parental_status_name(track_data["title"]),
                 album_id=album_id,
-                album=self.sanitize_meta_name(track_data["album"]["title"]),
+                album=self.sanitize_parental_status_name(track_data["album"]["title"]),
                 artists=artists,
                 tags=tags,
                 codec=track_to_use.codec,
@@ -620,8 +611,7 @@ class ModuleInterface:
             )
         explicit = any(track["parentalControls"]["hasExplicitLanguage"] for track in album_data.get("tracks", []))
         return AlbumInfo(
-            # name=album_data.get("title", "Unknown name"),
-            name=self.sanitize_meta_name(album_data.get("title", "Unknown")),
+            name=self.sanitize_parental_status_name(album_data.get("title", "Unknown")),
             artist=album_data.get("primaryArtistName", ""),
             tracks=[track["asin"] for track in album_data.get("tracks", [])],
             release_year=int(self._get_date_from_metadata(album_data).strftime("%Y")),
@@ -938,12 +928,20 @@ class ModuleInterface:
         return f"{milliseconds // 60000:02}:{(milliseconds // 1000) % 60:02}.{milliseconds % 1000:03}"
     
     @staticmethod
-    def sanitize_meta_name(name: str):
+    def sanitize_parental_status_name(name: str):
         sanitized = re.split(r"(\s\[Explicit\]|\s\[Clean\])$", name, maxsplit=1)
         if len(sanitized) >= 2:
             return sanitized[0]
         # No matches found
         return name
+
+    @staticmethod
+    def parse_credit_names_from_name(name: str):
+        return {str(item) for item in re.split(r", | & | - | / ", name) if item}
+    
+    @staticmethod
+    def parse_genres_from_genre(name: str):
+        return {str(item) for item in re.split(r", | & | - | / |/", name) if item != "General"}
     
     @staticmethod
     def format_cover_url(url: str, options: CoverOptions):
@@ -994,6 +992,7 @@ class ModuleInterface:
                 unit="B",
                 unit_scale=True,
                 unit_divisor=1024,
+                disable=False,
             ) as pbar:
                 while download.is_active:
                     download.update()
@@ -1146,7 +1145,7 @@ class ModuleInterface:
 
         """
         # LOGGER.debug(json.dumps(mpd, indent=3))
-        avaliable_tracks = self._mpd_to_audio_track(mpd, track_asin)
+        avaliable_tracks = self._siren_mpd_to_audio_track(mpd, track_asin)
 
         # Sorting by bitrate helps retrieve the highest resolution avaliable
         LOGGER.debug(avaliable_tracks)
@@ -1169,12 +1168,13 @@ class ModuleInterface:
         LOGGER.debug(mapped_audio_tracks)
         return mapped_audio_tracks
 
-    def _mpd_to_audio_track(self, manifest: ElementTree.Element, track_asin: str):
+    def _siren_mpd_to_audio_track(self, manifest: ElementTree.Element, track_asin: str):
         """
-        Iterate over the manifest to grab the tracks and append them to avaliable_tracks as a AudioTrack object
-
-
-        (which is a xml file that follows the urn:mpeg:dash:profile:isoff-on-demand:2011 profile)
+        Retrieve each avaliable audio quality/format as a AudioTrack.
+        
+        The manifest must be retrieved from manifest API endpoint with the SIREN / SIREN_KATANA DASH version.
+        
+        The manifest must follow the `urn:mpeg:dash:profile:isoff-on-demand:2011` XML profile. 
         """
 
         # manifest = dict(mpd["MPD"]["Period"])
