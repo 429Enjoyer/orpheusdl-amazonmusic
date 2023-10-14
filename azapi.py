@@ -160,7 +160,10 @@ class AmazonMusicMobileAPI:
 
         code_verifier = create_code_verifier()
 
-        marketplace_id = cls.get_marketplace_id(country_code) or cls._get_web_client_configuration(domain).marketplace_id
+        marketplace_id = (
+            cls.get_marketplace_id(country_code)
+            or cls._get_web_client_configuration(domain).marketplace_id
+        )
         oauth_url, serial = cls._build_oauth_url(
             domain="com",
             market_place_id=marketplace_id,
@@ -252,7 +255,11 @@ class AmazonMusicMobileAPI:
                 # print(f"Handling request: {request} at {time.perf_counter()}")
                 resp = session.send(request)
                 resp.raise_for_status()
-                LOGGER.debug("OK with request with status code %s for request %s", resp.status_code, request.url)
+                LOGGER.debug(
+                    "OK with request with status code %s for request %s",
+                    resp.status_code,
+                    request.url,
+                )
             except httpx.HTTPError as ce:
                 LOGGER.error(ce)
                 if resp:
@@ -418,7 +425,7 @@ class AmazonMusicMobileAPI:
 
         LOGGER.debug(json.dumps(resp_json, indent=2))
         return resp_json
-    
+
     def get_page(
         self,
         uri: str,
@@ -681,7 +688,7 @@ class AmazonMusicMobileAPI:
             },
         )
         return dict(resp.json())
-    
+
     def get_user_playlist(self, playlist_uuid: str):
         """
         Get a playlist and its tracks.
@@ -704,13 +711,8 @@ class AmazonMusicMobileAPI:
                     "deviceId": self.credentials.device_info["device_serial_number"],
                     "deviceType": AmazonMobileApplication.MUSIC.device_type,
                 },
-                "featureSet": [
-                    "SUPPORT_MIXED_ID_TYPES",
-                    "INCLUDE_FOLLOWER_COUNT"
-                ],
-                "playlistIds": [
-                    playlist_uuid
-                ],
+                "featureSet": ["SUPPORT_MIXED_ID_TYPES", "INCLUDE_FOLLOWER_COUNT"],
+                "playlistIds": [playlist_uuid],
                 "requestedMetadata": [
                     "albumArtistAsin",
                     "albumArtistName",
@@ -778,12 +780,11 @@ class AmazonMusicMobileAPI:
                     "title",
                     "trackNum",
                     "errorCode",
-                    "uploaded"
-                ]
-            }
+                    "uploaded",
+                ],
+            },
         )
         return dict(resp.json())
-    
 
     def get_recent_tracks(self):
         """
@@ -950,7 +951,7 @@ class AmazonMusicMobileAPI:
                     "deviceTypeId": AmazonMobileApplication.MUSIC.device_type,
                 },
                 "musicDashVersionList": [
-                    # "SIREN", # assuming that its used for free and prime subscription tiers 
+                    # "SIREN", # assuming that its used for free and prime subscription tiers
                     "SIREN_KATANA",  # with 360 audio, but keeps on getting invalid key size (with group_pssh)? PSSH Entitled key size is always 32 bytes, not sure why (brings error if used)
                     # "SIREN_KATANA_NO_CLEAR_LEAD", #this and no entitlement, is what is used by Amazon Music Web
                     # "V2", # for obtaining legacy AAC audio
@@ -962,7 +963,6 @@ class AmazonMusicMobileAPI:
                 #     "MEDIUM",
                 #     "LOW",
                 # ],
-
                 # Sometimes having tryAsinSubstitution set to true
                 # but no try3dAsinSubstitution
                 # fails to get 360RA audio (3-6) for these albums:
@@ -1109,35 +1109,37 @@ class AmazonMusicMobileAPI:
                     {
                         "interface": "Touch.SwipeablePagesTemplateInterface.v1_0.SwipeablePagesClientInformation",
                         "isChartsV3Enabled": True,
-                        "isStageEnabled": False
+                        "isStageEnabled": False,
                     }
-                )
+                ),
             },
         )
 
         # LOGGER.debug(json.dumps(response.json(), indent=3))
-        
-        resp_dict = response.json()
+
+        resp_dict = dict(response.json())
 
         if parse_credits:
             return self.parse_credits_from_xray(resp_dict)
 
         return resp_dict
-    
+
     @staticmethod
     def proper_credits_names():
-        """ Some credit names are not formatted correctly, this can be used to fix them. """
+        """Some credit names are not formatted correctly, this can be used to fix them."""
         return {
             "Performed By": "Performer",
             "Written By": "Lyricist",
             "Produced By": "Producer",
         }
-    
+
     @staticmethod
     def parse_credits_from_xray(response: dict):
         credits_mapping: dict[str, list[str]] = {}
         for method in response.get("methods", []):
-            if not str(method.get("interface", "")).endswith("CreateAndBindManagedContainerMethod"):
+            if not str(method.get("interface", "")).endswith(
+                "CreateAndBindManagedContainerMethod"
+            ):
                 # print("not CreateAndBindManagedContainerMethod")
                 continue
             for page in method.get("template", {}).get("pages", []):
@@ -1147,33 +1149,40 @@ class AmazonMusicMobileAPI:
                 if str(page.get("label", {}).get("title")) != "CREDITS":
                     # print("label title not CREDITS")
                     continue
-                
+
                 for page_element in page.get("elements", []):
-                    if not str(page_element.get("interface", "")).endswith("VerticalContainerElement"):
+                    if not str(page_element.get("interface", "")).endswith(
+                        "VerticalContainerElement"
+                    ):
                         continue
                     credit_name: str = ""
                     people_names: list[str] = []
-                    
+
                     for container_element in page_element.get("elements", []):
-                        if str(container_element.get("interface", "")).endswith("LabelElement"):
-                           raw_credit_name = str(container_element["text"]).title()
-                           credit_name = AmazonMusicMobileAPI.proper_credits_names().get(
-                               raw_credit_name,
-                               raw_credit_name
+                        if str(container_element.get("interface", "")).endswith(
+                            "LabelElement"
+                        ):
+                            raw_credit_name = str(container_element["text"]).title()
+                            credit_name = (
+                                AmazonMusicMobileAPI.proper_credits_names().get(
+                                    raw_credit_name, raw_credit_name
+                                )
                             )
 
-                        if str(container_element.get("interface", "")).endswith("ClickableTextElement"):
+                        if str(container_element.get("interface", "")).endswith(
+                            "ClickableTextElement"
+                        ):
                             people_names.append(container_element["text"])
-                    
+
                     if not (credit_name and people_names):
                         continue
-                    
+
                     names = credits_mapping.get(credit_name, [])
-                    
+
                     # Remove duplicate names
                     names = list(set(names + people_names))
                     credits_mapping.update({credit_name: names})
-                    
+
         return credits_mapping
 
     @staticmethod
@@ -2005,7 +2014,6 @@ class AmazonMusicMobileAPI:
     @staticmethod
     def get_marketplace_id(country_code: str):
         """Returns the marketplace id for a given country code"""
-        # NOTE: this can be retrived by parsing the appConfig from the root on the netloc
         # marketplace ID for amazon prime video japan: ART4WZ8MWBX2Y
         ids = {
             "US": "ATVPDKIKX0DER",

@@ -1,6 +1,8 @@
 import base64
 import logging
 from pathlib import Path
+import os
+import itertools
 import re
 import shutil
 import socket
@@ -10,7 +12,7 @@ import typing
 import json
 import dataclasses
 import itertools
-from datetime import datetime
+from datetime import datetime, timedelta
 import concurrent.futures
 from urllib.parse import urlparse
 from uuid import UUID, uuid1, uuid4
@@ -26,11 +28,18 @@ from xml.etree import ElementTree
 
 
 from utils.models import *
-from utils.utils import create_temp_filename, download_file, download_to_temp, silentremove, sanitise_name
+from utils.utils import (
+    create_temp_filename,
+    download_file,
+    download_to_temp,
+    silentremove,
+    sanitise_name,
+)
 
 from .azapi import AmazonMusicMobileAPI, AmazonMusicMobileAPICredentials
 
 LOGGER = logging.getLogger(__name__)
+
 
 @dataclasses.dataclass(slots=True)
 class AudioTrack:
@@ -210,11 +219,13 @@ class ModuleInterface:
             for url_check, media_type in url_constants.items()
             if url_check in components
         ]
-        
+
         if len(components) > 2:
             return MediaIdentification(
                 media_type=type_matches[-1],
-                media_id=components[1] if type_matches[-1] is DownloadTypeEnum.artist else components[2], # my/playlists/uuid
+                media_id=components[1]
+                if type_matches[-1] is DownloadTypeEnum.artist
+                else components[2],  # my/playlists/uuid
             )
         else:
             return MediaIdentification(
@@ -323,23 +334,27 @@ class ModuleInterface:
                         artists.remove(artist)
                     artists.extend(sep_artists)
 
-            # Remove duplicates
-            # artists = list(set(artists))
-            # Prefer to have the primary artist name at the start
-            if (
+            primary_artist_names = self.parse_credit_names_from_name(
                 album_data["primaryArtistName"]
-                and album_data["primaryArtistName"] in artists
-            ):
+            )
+
+            if album_data["primaryArtistName"] in artists:
                 artists.remove(album_data["primaryArtistName"])
-                artists.insert(0, album_data["primaryArtistName"])
+            if primary_artist_names[0] in artists:
+                artists.remove(primary_artist_names[0])
+
+            artists.extend(primary_artist_names[1:])
+
+            # Remove duplicates
+            artists = natsort.natsorted(set(artists))
+
+            # Prefer to have the primary artist name at the start
+            artists.insert(0, primary_artist_names[0])
 
             # Calculate the total disc avaliable by iterating each track and using the highest value
             disc_total = max(int(t["discNum"]) for t in album_data.get("tracks", [{}]))
             # Sanitize writers
             writers = [str(item).strip() for item in track_data.get("songWriters", [])]
-
-            # Sometimes writers are just one item in a list, seperated with /
-            # e.g https://music.amazon.co.jp/albums/B0CG7FWYTK
 
             for name in writers.copy():
                 if names := self.parse_credit_names_from_name(name):
@@ -373,7 +388,7 @@ class ModuleInterface:
             if track_to_use.reference_loudness:
                 extra_tags.update(
                     {
-                        "REPLAYGAIN_REFERENCE_LOUDNESS": track_to_use.reference_loudness # ref. https://wiki.hydrogenaud.io/index.php?title=ReplayGain_2.0_specification
+                        "REPLAYGAIN_REFERENCE_LOUDNESS": track_to_use.reference_loudness  # ref. https://wiki.hydrogenaud.io/index.php?title=ReplayGain_2.0_specification
                     }
                 )
 
@@ -381,8 +396,13 @@ class ModuleInterface:
             # this genre tends to be more specific however,
             # it may not be always avaliable
             # e.g https://music.amazon.co.jp/albums/B09JNRPVHN?trackAsin=B09JNRQQ3P
-            genres = self.parse_genres_from_genre(search_data.get("primaryGenre", "")) | self.parse_genres_from_genre(album_data["productDetails"]["primaryGenreName"])
-            
+            genres = list(
+                self.parse_genres_from_genre(search_data.get("primaryGenre", ""))
+                | self.parse_genres_from_genre(
+                    album_data["productDetails"]["primaryGenreName"]
+                )
+            )
+
             tags = Tags(
                 album_artist=album_data["primaryArtistName"],
                 composer=composers,
@@ -395,7 +415,7 @@ class ModuleInterface:
                 total_tracks=int(album_data["trackCount"] or 1),  # None/0/1 if no discs
                 # replay_gain=0.0,
                 # replay_peak=0.0,
-                genres=list(genres),
+                genres=genres,
                 label=album_data["productDetails"]["label"],
                 release_date=release_datetime.strftime(
                     "%Y-%m-%d"
@@ -403,19 +423,18 @@ class ModuleInterface:
                 # comment=comment,
                 extra_tags=extra_tags,
             )
-            
+
             cover_url, search_data = self.get_hi_res_cover(
                 asins=(album_id, album_data["requestedAsin"]),
                 query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
-                search_data=search_data
+                search_data=search_data,
             )
             if not cover_url:
                 # Default 600 x 600 cover art
                 cover_url = str(album_data.get("image", ""))
             else:
                 cover_url = self.format_cover_url(
-                    cover_url,
-                    self.options.default_cover_options
+                    cover_url, self.options.default_cover_options
                 )
 
             return TrackInfo(
@@ -459,7 +478,7 @@ class ModuleInterface:
         try:
             os.makedirs("temp/", exist_ok=True)
             encrypted_track_location = f"{create_temp_filename()}.mp4"
-            
+
             self.download(
                 audio_track.url,
                 encrypted_track_location,
@@ -513,23 +532,21 @@ class ModuleInterface:
             final_decrypted_track_location = (
                 f"{create_temp_filename()}.{selected_codec_data.container.name}"
             )
-            
-            ffcmd: ffmpeg = ffmpeg.input(decrypted_track_location) # type: ignore
+
+            ffcmd: ffmpeg = ffmpeg.input(decrypted_track_location)  # type: ignore
             ffcmd_out_kwargs = {
                 "filename": final_decrypted_track_location,
                 "loglevel": "warning",
                 "audio_bitrate": f"{audio_track.bitrate}k",
-            }      
+            }
             if self.settings["trim_track_by_sample_rate"]:
                 ffcmd_out_kwargs.update(
-                    {
-                        "af": f"atrim=start_sample={audio_track.sample_rate * 6.5}"
-                    }
+                    {"af": f"atrim=start_sample={audio_track.sample_rate * 6.5}"}
                 )
 
             ffcmd = ffcmd.output(**ffcmd_out_kwargs)
             ffcmd.run()
-            
+
             silentremove(decrypted_track_location)
 
         # except Exception as e:
@@ -559,7 +576,7 @@ class ModuleInterface:
         cover_url, search_data = self.get_hi_res_cover(
             asins=(album_id, album_data["requestedAsin"]),
             query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
-            search_data=data.get(f"{album_id}_search")
+            search_data=data.get(f"{album_id}_search"),
         )
         if not cover_url:
             # Default 600 x 600 cover art
@@ -567,8 +584,7 @@ class ModuleInterface:
             tracks_cover_art = cover_url
         else:
             tracks_cover_art = self.format_cover_url(
-                cover_url,
-                self.options.default_cover_options
+                cover_url, self.options.default_cover_options
             )
 
         # album_data = self.mobile_session.get_album_info(album_id, use_alternative_naming=True)
@@ -610,10 +626,15 @@ class ModuleInterface:
                     f" Is this ASIN in the same region as the account?"
                 )
             )
-        explicit = any(track["parentalControls"]["hasExplicitLanguage"] for track in album_data.get("tracks", []))
+        explicit = any(
+            track["parentalControls"]["hasExplicitLanguage"]
+            for track in album_data.get("tracks", [])
+        )
         return AlbumInfo(
             name=self.sanitize_parental_status_name(album_data.get("title", "Unknown")),
-            artist=album_data.get("primaryArtistName", ""),
+            artist=self.parse_credit_names_from_name(
+                album_data.get("primaryArtistName", "")
+            )[0],
             tracks=[track["asin"] for track in album_data.get("tracks", [])],
             release_year=int(self._get_date_from_metadata(album_data).strftime("%Y")),
             explicit=explicit,
@@ -636,20 +657,20 @@ class ModuleInterface:
     ) -> (
         PlaylistInfo
     ):  # Mandatory if either ModuleModes.download or ModuleModes.playlist
-        p_data = (
-            data[playlist_id]
-            if playlist_id in data
-            else {}
-        )
+        p_data = data[playlist_id] if playlist_id in data else {}
 
         if not p_data:
             if len(playlist_id) == 10:
                 # An ASIN
-                p_data = self.mobile_session.get_catalog_playlist(playlist_id)['playlist']
+                p_data = self.mobile_session.get_catalog_playlist(playlist_id)[
+                    "playlist"
+                ]
             else:
                 # A user playlist (either from the shared link, or the address bar)
-                p_data = self.mobile_session.get_user_playlist(playlist_id)["playlists"][0]
-        
+                p_data = self.mobile_session.get_user_playlist(playlist_id)[
+                    "playlists"
+                ][0]
+
         p_data = dict(p_data)
 
         return PlaylistInfo(
@@ -658,7 +679,9 @@ class ModuleInterface:
             tracks=[track["metadata"]["asin"] for track in p_data.get("tracks", [])],
             release_year=0,
             duration=p_data["metadata"]["durationSeconds"],
-            explicit=p_data.get("metadata", {}).get("parentalControls", {}).get("hasExplicitLanguage", False),
+            explicit=p_data.get("metadata", {})
+            .get("parentalControls", {})
+            .get("hasExplicitLanguage", False),
             creator_id=p_data.get("metadata", {}).get("profileId"),  # optional
             cover_url=p_data["metadata"]["fourSquareArt"]["url"],  # optional
             cover_type=ImageFileTypeEnum.jpg,  # optional
@@ -745,7 +768,17 @@ class ModuleInterface:
     ):  # Mandatory if ModuleModes.credits
         track_credits = self.mobile_session.get_track_xray(track_id, parse_credits=True)
         LOGGER.debug("Credits: %s", track_credits)
-        return [CreditsInfo(sanitise_name(k), v) for k, v in track_credits.items()]
+        return [
+            CreditsInfo(
+                sanitise_name(k),
+                list(
+                    itertools.chain.from_iterable(
+                        [self.parse_credit_names_from_name(name) for name in v]
+                    )
+                ),
+            )
+            for k, v in track_credits.items()
+        ]
 
     def get_track_cover(
         self, track_id: str, cover_options: CoverOptions, data={}
@@ -764,20 +797,19 @@ class ModuleInterface:
         cover_url, _ = self.get_hi_res_cover(
             asins=(album_id, album_data["requestedAsin"]),
             query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
-            search_data=data.get(f"{album_id}_search")
+            search_data=data.get(f"{album_id}_search"),
         )
         if not cover_url:
             # Default 600 x 600 cover art
             cover_url = str(album_data.get("image", ""))
         else:
             cover_url = self.format_cover_url(
-                cover_url,
-                self.options.default_cover_options
+                cover_url, cover_options
             )
 
         return CoverInfo(
             url=cover_url,
-            file_type=self.options.default_cover_options.file_type,
+            file_type=cover_options.file_type,
         )
 
     def get_track_lyrics(
@@ -871,8 +903,13 @@ class ModuleInterface:
         ]
 
     # helpers
-    
-    def get_hi_res_cover(self, asins: typing.Iterable[str], query: str, search_data: typing.Optional[dict] = {}):
+
+    def get_hi_res_cover(
+        self,
+        asins: typing.Iterable[str],
+        query: str,
+        search_data: typing.Optional[dict] = {},
+    ):
         search_data = None
         cover_url = None
 
@@ -884,8 +921,13 @@ class ModuleInterface:
                 search_types=("catalog_album",),
                 limit=100,
             )
-         
-        cover_url = str(search_data.get("artOriginal", {}).get("artUrl", search_data.get("metadata", {}).get("albumArt", {}).get("url", "")))
+
+        cover_url = str(
+            search_data.get("artOriginal", {}).get(
+                "artUrl",
+                search_data.get("metadata", {}).get("albumArt", {}).get("url", ""),
+            )
+        )
 
         if not cover_url:
             # These types of album/tracks are unique as they only appear in Playlists (curated by Amazon Music)
@@ -897,23 +939,26 @@ class ModuleInterface:
                 search_types=("catalog_playlist",),
                 limit=100,
             ):
-                p_data = self.mobile_session.get_catalog_playlist(p_search_data["seriesAsin"])
+                p_data = self.mobile_session.get_catalog_playlist(
+                    p_search_data["seriesAsin"]
+                )
                 for track in p_data.get("playlist", {}).get("tracks", []):
                     if track.get("metadata", {}).get("albumAsin") not in asins:
                         continue
                     search_data = track
-                    cover_url = str(track.get("metadata", {}).get("albumArt", {}).get("url", ""))
+                    cover_url = str(
+                        track.get("metadata", {}).get("albumArt", {}).get("url", "")
+                    )
                     break
                 else:
                     continue
                 break
 
-
         return cover_url, search_data
 
     @staticmethod
     def _get_date_from_metadata(album_data: dict[str, typing.Any]):
-        return datetime.fromtimestamp(
+        proper_ts = (
             int(
                 str(
                     album_data.get("originalReleaseDate")
@@ -922,12 +967,18 @@ class ModuleInterface:
             )
             / 1000
         )
+        if os.name == "nt" and proper_ts < 0:
+            # Windows doesn't fully support any dates
+            # before 1970 (negative dates), so this is a workaround.
+            return datetime(1970, 1, 1) - timedelta(seconds=abs(proper_ts))
+
+        return datetime.fromtimestamp(proper_ts)
 
     @staticmethod
     def milliseconds_to_lrc_time(milliseconds: int):
         # Convert milliseconds to the proper LRC time format [mm:ss.xxx]
         return f"{milliseconds // 60000:02}:{(milliseconds // 1000) % 60:02}.{milliseconds % 1000:03}"
-    
+
     @staticmethod
     def sanitize_parental_status_name(name: str):
         sanitized = re.split(r"(\s\[Explicit\]|\s\[Clean\])$", name, maxsplit=1)
@@ -938,19 +989,29 @@ class ModuleInterface:
 
     @staticmethod
     def parse_credit_names_from_name(name: str):
-        return {str(item) for item in re.split(r", | & | - | / ", name) if item}
-    
+        return list(
+            {str(item) for item in re.split(r", | & | - | / | feat. ", name) if item}
+        )
+
     @staticmethod
     def parse_genres_from_genre(name: str):
-        return {str(item) for item in re.split(r", | & | - | / |/", name) if item != "General"}
-    
+        return {
+            str(item)
+            for item in re.split(r", | & | - | / |/", name)
+            if item != "General"
+        }
+
     @staticmethod
     def format_cover_url(url: str, options: CoverOptions):
         frag_url, extension = url.rsplit(".", 1)
-        file_format = f"_FM{options.file_type.name}" if options.file_type != ImageFileTypeEnum.jpg else ""
-        
+        file_format = (
+            f"_FM{options.file_type.name}"
+            if options.file_type != ImageFileTypeEnum.jpg
+            else ""
+        )
+
         new_url = f"{frag_url}.SX{options.resolution}{file_format}.{extension}"
-        
+
         return new_url
 
     def download(self, url: str, location: str, use_aria2c: typing.Optional[bool]):
@@ -993,7 +1054,7 @@ class ModuleInterface:
                 unit="B",
                 unit_scale=True,
                 unit_divisor=1024,
-                disable=True,
+                disable=False,
             ) as pbar:
                 while download.is_active:
                     download.update()
@@ -1172,10 +1233,10 @@ class ModuleInterface:
     def _siren_mpd_to_audio_track(self, manifest: ElementTree.Element, track_asin: str):
         """
         Retrieve each avaliable audio quality/format as a AudioTrack.
-        
+
         The manifest must be retrieved from manifest API endpoint with the SIREN / SIREN_KATANA DASH version.
-        
-        The manifest must follow the `urn:mpeg:dash:profile:isoff-on-demand:2011` XML profile. 
+
+        The manifest must follow the `urn:mpeg:dash:profile:isoff-on-demand:2011` XML profile.
         """
 
         # manifest = dict(mpd["MPD"]["Period"])
@@ -1215,15 +1276,19 @@ class ModuleInterface:
                     # print(prop.get("schemeIdUri"))
                     if prop.get("schemeIdUri") == "amz-music:trackType":
                         official_quality_name = prop.get("value", "Unknown")
-                        LOGGER.debug(f"Official name for track: {official_quality_name}")
+                        LOGGER.debug(
+                            f"Official name for track: {official_quality_name}"
+                        )
                         continue
                     if prop.get("schemeIdUri") == "urn:mpeg:mpegB:cicp:ProgramLoudness":
                         audio_ref_loudness = prop.get("value", "Unknown")
                         continue
-                
+
                 if not official_quality_name:
                     # print(f"{official_quality_name}, {audio_ref_loudness}")
-                    raise ValueError("Failed to parse pretty quality name from SupplementalProperty for AudioTrack")
+                    raise ValueError(
+                        "Failed to parse pretty quality name from SupplementalProperty for AudioTrack"
+                    )
 
                 for representation in adaptation_set.findall("Representation"):
                     media_url_elem = representation.find("BaseURL")
@@ -1266,7 +1331,7 @@ class ModuleInterface:
                         sp = representation.find("SupplementalProperty")
                         if sp is not None:
                             bit_depth = int(sp.get("value", 0))
-                    
+
                     avaliable_tracks.append(
                         AudioTrack(
                             asin=track_asin,
@@ -1285,7 +1350,7 @@ class ModuleInterface:
                             ),
                             quality=quality,
                             pssh=pssh,
-                            reference_loudness=audio_ref_loudness
+                            reference_loudness=audio_ref_loudness,
                         )
                     )
 
