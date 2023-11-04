@@ -1498,7 +1498,7 @@ class ModuleInterface:
     @staticmethod
     def call_shaka_packager(encrypted_file: str, destination_file: str, key_id: str, key: str, label: str):
         platform = {"win32": "win", "darwin": "osx"}.get(sys.platform, sys.platform)
-        executable = pywidevine.get_binary_path("shaka-packager", f"packager-{platform}", f"packager-{platform}-x64")
+        executable = pywidevine.get_binary_path(f"packager-{platform}", f"packager-{platform}-x64", "shaka-packager", "packager")
         if not executable:
             raise EnvironmentError("Shaka Packager executable not found but is required")
 
