@@ -1391,7 +1391,7 @@ class ModuleInterface:
 
                 bit_depth = None
                 sp = representation.find("SupplementalProperty")
-                if sp is not None:
+                if sp is not None and not codec_data[codec].spatial:
                     bit_depth = int(sp.get("value", 0))
 
                 avaliable_tracks.append(
