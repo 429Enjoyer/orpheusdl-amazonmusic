@@ -21,7 +21,9 @@ from pymp4.parser import Box
 import aria2p
 import ffmpeg
 import natsort
-from pywidevine import PSSH, Cdm, Device
+import pywidevine
+from pywidevine import PSSH, Cdm, Device, WidevinePsshData
+from Crypto.Cipher import AES
 
 from tqdm import tqdm
 from xml.etree import ElementTree
@@ -40,6 +42,19 @@ from .azapi import AmazonMusicMobileAPI, AmazonMusicMobileAPICredentials
 
 LOGGER = logging.getLogger(__name__)
 
+@dataclasses.dataclass(slots=True)
+class PSSHEntitlements:
+    katana: typing.Optional[PSSH] = None
+    """ Unlimited subscription tier """
+    robin: typing.Optional[PSSH] = None
+    """ Amazon Prime subscription tier """
+    hawkfire: typing.Optional[PSSH] = None
+    """ Free tier """
+    sonic: typing.Optional[PSSH] = None
+
+    def to_dict(self):
+        return dataclasses.asdict(self)
+
 
 @dataclasses.dataclass(slots=True)
 class AudioTrack:
@@ -52,7 +67,8 @@ class AudioTrack:
     official_quality_name: str
     quality: str
     quality_ranking: int
-    pssh: PSSH
+    entitlements: PSSHEntitlements
+    web_pssh: PSSH
     # pssh: typing.Any
     reference_loudness: Optional[str] = None
     """ e.g 7.2 LUFS, some manifests don't include it """
@@ -62,7 +78,7 @@ class AudioTrack:
         return dataclasses.asdict(self)
 
 
-# This is a Amazon Music module for OrpheusDL, requires an active unlimited subscription
+# This is a Amazon Music module for OrpheusDL, requires an active account (optionally requires a active paid subscription)
 
 module_information = ModuleInformation(  # Only service_name and module_supported_modes are mandatory
     service_name="Amazon Music",
@@ -84,6 +100,10 @@ module_information = ModuleInformation(  # Only service_name and module_supporte
         "prefer_aria2c": False,
         "trim_track_by_sample_rate": True,
         "max_track_quality_to_use": "",
+        "use_own_master_keys": False,
+        "master_keys": {
+            "TIER (KATANA/ROBIN):ISO 3166-1 Alpha-2 Country Code": "64 character key string in hex"
+        }
     },
     global_storage_variables=[],
     session_settings={
@@ -263,6 +283,10 @@ class ModuleInterface:
                 else self.mobile_session.get_album_info(album_id)
             )
             album_id = str(album_data["asin"])
+            
+            # if playlist_track_metadata := data.get(f"{track_id}_playlist"):
+            #     import pprint
+            #     pprint.pprint(playlist_track_metadata)
 
             # NOTE: I *could* use catalog_track AND catalog album
             # but I prefer to limit the amount of API Requests per track
@@ -436,7 +460,7 @@ class ModuleInterface:
                 cover_url = self.format_cover_url(
                     cover_url, self.options.default_cover_options
                 )
-
+            
             return TrackInfo(
                 name=self.sanitize_parental_status_name(track_data["title"]),
                 album_id=album_id,
@@ -485,31 +509,71 @@ class ModuleInterface:
                 use_aria2c=self.settings["prefer_aria2c"],
             )
 
-            # decrypt the file (attempt to request a license)
-            session_id = self.cdm.open()
-            license_challenge = base64.b64encode(
-                self.cdm.get_license_challenge(
-                    session_id, audio_track.pssh, privacy_mode=False
-                )
-            ).decode("utf-8")
-
-            license_response = self.mobile_session.get_license_response(
-                asin=audio_track.asin, challenge=license_challenge
-            )
-            if not license_response:
-                license_response = input(
-                    "License retrieval failed, enter response here: "
-                )
-            self.cdm.parse_license(session_id, license_response)
-
             decrypted_track_location = f"{create_temp_filename()}.mp4"  # {codec_data[audio_track.codec].container.name}
 
-            self.cdm.decrypt(
-                session_id,
-                encrypted_track_location,
-                decrypted_track_location,
-                exists_ok=True,
-            )
+            if (
+                self.settings["use_own_master_keys"] 
+                and any(str(item).endswith(self.mobile_session.credentials.web_client_config.music_territory) for item in self.settings["master_keys"])
+            ):
+                while True:
+                    pd = WidevinePsshData()
+                    main_key: bytes = b""
+                    for name, entitle_pssh in audio_track.entitlements.to_dict().items():
+                        if not isinstance(entitle_pssh, PSSH):
+                            continue
+                        key_name = f"{name.upper()}:{self.mobile_session.credentials.web_client_config.music_territory}"
+                        if key_name not in self.settings["master_keys"]:
+                            continue
+                        
+                        pd.ParseFromString(entitle_pssh.init_data)
+                        main_key = bytes.fromhex(self.settings["master_keys"][key_name])
+                        break
+                    
+                    if not main_key:
+                        break
+                    
+                    key_id = pd.entitled_keys[0].key_id.hex()
+                    
+                    LOGGER.debug(f"Using {main_key.hex()} as the master key.")
+                    
+                    cipher = AES.new(main_key, AES.MODE_CBC, pd.entitled_keys[0].iv)
+                    final_key = cipher.decrypt(pd.entitled_keys[0].key)[:16].hex()
+                    LOGGER.debug(f"Final key id and decryption key: '{key_id}:{final_key}'")
+                    self.call_shaka_packager(
+                        encrypted_file=encrypted_track_location,
+                        destination_file=decrypted_track_location,
+                        key_id=key_id,
+                        key=final_key,
+                        label=audio_track.quality.upper()
+                    )
+                    break
+                    
+            if not os.path.exists(decrypted_track_location):
+                # interact with the license server
+                session_id = self.cdm.open()
+                license_challenge = base64.b64encode(
+                    self.cdm.get_license_challenge(
+                        session_id, audio_track.web_pssh, privacy_mode=False
+                    )
+                ).decode("utf-8")
+
+                license_response = self.mobile_session.get_license_response(
+                    asin=audio_track.asin, challenge=license_challenge
+                )
+                if not license_response:
+                    license_response = input(
+                        "License retrieval failed, enter response here (for testing): "
+                    )
+
+                self.cdm.parse_license(session_id, license_response)
+
+                self.cdm.decrypt(
+                    session_id,
+                    encrypted_track_location,
+                    decrypted_track_location,
+                    exists_ok=True,
+                )
+
             if not os.path.exists(decrypted_track_location):
                 raise FileNotFoundError("Unable to decrypt the downloaded media file")
 
@@ -630,6 +694,7 @@ class ModuleInterface:
             track["parentalControls"]["hasExplicitLanguage"]
             for track in album_data.get("tracks", [])
         )
+
         return AlbumInfo(
             name=self.sanitize_parental_status_name(album_data.get("title", "Unknown")),
             artist=self.parse_credit_names_from_name(
@@ -672,7 +737,6 @@ class ModuleInterface:
                 ][0]
 
         p_data = dict(p_data)
-
         return PlaylistInfo(
             name=p_data["metadata"]["title"],
             creator=p_data.get("metadata", {}).get("curatedBy", ""),
@@ -686,7 +750,7 @@ class ModuleInterface:
             cover_url=p_data["metadata"]["fourSquareArt"]["url"],  # optional
             cover_type=ImageFileTypeEnum.jpg,  # optional
             description=p_data.get("metadata", {}).get("description"),  # optional
-            track_extra_kwargs={"data": ""},  # optional, whatever you want
+            track_extra_kwargs={"data": {f'{track["metadata"]["asin"]}_playlist': track["metadata"] for track in p_data.get("tracks", [])}},  # optional, whatever you want
         )
 
     def get_artist_info(
@@ -1207,7 +1271,7 @@ class ModuleInterface:
 
         """
         # LOGGER.debug(json.dumps(mpd, indent=3))
-        avaliable_tracks = self._siren_mpd_to_audio_track(mpd, track_asin)
+        avaliable_tracks = self.get_audios_from_mpd(mpd, track_asin)
 
         # Sorting by bitrate helps retrieve the highest resolution avaliable
         LOGGER.debug(avaliable_tracks)
@@ -1229,8 +1293,8 @@ class ModuleInterface:
         )
         LOGGER.debug(mapped_audio_tracks)
         return mapped_audio_tracks
-
-    def _siren_mpd_to_audio_track(self, manifest: ElementTree.Element, track_asin: str):
+    
+    def get_audios_from_mpd(self, manifest: ElementTree.Element, track_asin: str):
         """
         Retrieve each avaliable audio quality/format as a AudioTrack.
 
@@ -1238,122 +1302,134 @@ class ModuleInterface:
 
         The manifest must follow the `urn:mpeg:dash:profile:isoff-on-demand:2011` XML profile.
         """
-
-        # manifest = dict(mpd["MPD"]["Period"])
         avaliable_tracks: list[AudioTrack] = []
+        ns = {
+            "mpd": "urn:mpeg:dash:schema:mpd:2011",
+            "drm": "urn:mpeg:cenc:2013",
+            "amz": "urn:amazon:music:drm:2019",
+        }
 
-        for period in manifest.findall("Period"):
-            for adaptation_set in period.findall("AdaptationSet"):
-                # content_type = adaptation_set.get("contentType")
-                # if content_type != "audio":
-                #     raise ValueError("Only supports audio MPDs!")
-
-                pssh = None
-
-                for content_property in adaptation_set.findall("ContentProtection"):
-                    if (
-                        content_property.get("schemeIdUri")
-                        != "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
-                    ):
-                        continue
-
-                    pssh_elem = content_property.find("{urn:mpeg:cenc:2013}pssh")
-
-                    if not (pssh_elem is not None and pssh_elem.text):
-                        continue
-                    pssh = PSSH(pssh_elem.text, strict=True)
-
-                    break
-
-                else:
-                    # continue
-                    raise ValueError("Failed to find PSSH.")
-
-                official_quality_name: str | None = None
-                audio_ref_loudness: str | None = None
-                supplemental_properties = adaptation_set.findall("SupplementalProperty")
-                for prop in supplemental_properties:
-                    # print(prop.get("schemeIdUri"))
-                    if prop.get("schemeIdUri") == "amz-music:trackType":
-                        official_quality_name = prop.get("value", "Unknown")
-                        LOGGER.debug(
-                            f"Official name for track: {official_quality_name}"
-                        )
-                        continue
-                    if prop.get("schemeIdUri") == "urn:mpeg:mpegB:cicp:ProgramLoudness":
-                        audio_ref_loudness = prop.get("value", "Unknown")
-                        continue
-
-                if not official_quality_name:
-                    # print(f"{official_quality_name}, {audio_ref_loudness}")
-                    raise ValueError(
-                        "Failed to parse pretty quality name from SupplementalProperty for AudioTrack"
+        for adaptation_set in manifest.findall(".//AdaptationSet", ns):
+            entitlement_psshs: dict[str, PSSH] = {}
+            web_pssh: PSSH | None = None
+            for content_protection in adaptation_set.findall(
+                "ContentProtection", ns
+            ):
+                if (
+                    content_protection.get("schemeIdUri")
+                    == "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+                    and content_protection.get("value") == "AmzMusic-2019"
+                ):
+                    entitlement_psshs.update(
+                        {
+                            content_protection.find("amz:groupId", ns).text.split("_")[0].lower(): PSSH(content_protection.find("drm:pssh", ns).text, strict=True)
+                        }
                     )
+                if content_protection.get(
+                    "schemeIdUri"
+                ) == "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed" and not content_protection.get(
+                    "value"
+                ):
+                    web_pssh = PSSH(content_protection.find("drm:pssh", ns).text, strict=True)
+                    
+            if not web_pssh:
+                raise ValueError("Failed to find the PSSH for web playback.")
+            
+            official_quality_name = ""
+            audio_ref_loudness = ""
 
-                for representation in adaptation_set.findall("Representation"):
-                    media_url_elem = representation.find("BaseURL")
-                    if not (media_url_elem is not None and media_url_elem.text):
-                        raise IndexError(f"Failed to find Media URL for {track_asin}")
-                    media_url = media_url_elem.text
-
-                    muq = iter(re.split("=|&", urlparse(media_url).query))
-                    media_url_query = dict(zip(muq, muq))
-                    quality = str(media_url_query.get("ql"))
-
-                    if quality.startswith(
-                        "UHD"
-                    ) and not official_quality_name.startswith("UHD"):
-                        # amz-music:trackType only returns the following:
-                        # LD, SD, HD, and 3D
-                        official_quality_name = "UHD"
-                    elif official_quality_name is None:
-                        official_quality_name = quality
-
-                    codec = str(representation.get("codecs")).upper()
-                    # 360 Audio
-                    if codec.startswith("MHA1"):
-                        codec = "MHA1"
-                    elif codec.startswith("MHM1"):
-                        codec = "MHM1"
-                    # Dolby Atmos
-                    elif codec.startswith("EC-3"):
-                        codec = "EAC3"
-                    elif codec.startswith("AC-4"):
-                        codec = "AC4"
-                    # V2 musicDashVersionList
-                    elif codec.startswith("MP4A"):
-                        codec = "AAC"
-
-                    codec = CodecEnum[codec]
-
-                    bit_depth = None
-                    if codec is CodecEnum.FLAC:
-                        sp = representation.find("SupplementalProperty")
-                        if sp is not None:
-                            bit_depth = int(sp.get("value", 0))
-
-                    avaliable_tracks.append(
-                        AudioTrack(
-                            asin=track_asin,
-                            codec=codec,
-                            bit_depth=bit_depth,
-                            bitrate=int(
-                                int(representation.get("bandwidth") or 0) // 1000
-                            ),
-                            sample_rate=float(
-                                int(representation.get("audioSamplingRate") or 0) / 1000
-                            ),
-                            url=media_url,
-                            official_quality_name=official_quality_name,
-                            quality_ranking=int(
-                                representation.get("qualityRanking", 0)
-                            ),
-                            quality=quality,
-                            pssh=pssh,
-                            reference_loudness=audio_ref_loudness,
-                        )
+            # Get track type property (LD, SD, HD, SD)
+            if tt := next(
+                (
+                    supplemental_property
+                    for supplemental_property in adaptation_set.findall(
+                        "SupplementalProperty", ns
                     )
+                    if supplemental_property.attrib["schemeIdUri"]
+                    == "amz-music:trackType"
+                ),
+                None,
+            ):
+                official_quality_name = tt.attrib["value"]
 
+            # Get track loudness property
+            if pl := next(
+                (
+                    supplemental_property
+                    for supplemental_property in adaptation_set.findall(
+                        "SupplementalProperty", ns
+                    )
+                    if supplemental_property.attrib["schemeIdUri"]
+                    == "urn:mpeg:mpegB:cicp:ProgramLoudness"
+                ),
+                None,
+            ):
+                audio_ref_loudness = pl.attrib["value"]
+
+            for representation in adaptation_set.findall("Representation", ns):
+                media_url_elem = representation.find("BaseURL", ns)
+                if not (media_url_elem is not None and media_url_elem.text):
+                    raise IndexError(f"Failed to find Media URL for {track_asin}")
+                media_url = media_url_elem.text
+
+                muq = iter(re.split("=|&", urlparse(media_url).query))
+                media_url_query = dict(zip(muq, muq))
+                quality = str(media_url_query.get("ql"))
+
+                if quality.startswith(
+                    "UHD"
+                ) and not official_quality_name.startswith("UHD"):
+                    # amz-music:trackType only returns the following:
+                    # LD, SD, HD, and 3D
+                    official_quality_name = "UHD"
+                elif not official_quality_name:
+                    official_quality_name = quality
+
+                codec = str(representation.get("codecs")).upper()
+                # 360 Audio
+                if codec.startswith("MHA1"):
+                    codec = "MHA1"
+                elif codec.startswith("MHM1"):
+                    codec = "MHM1"
+                # Dolby Atmos
+                elif codec.startswith("EC-3"):
+                    codec = "EAC3"
+                elif codec.startswith("AC-4"):
+                    codec = "AC4"
+                # V2 musicDashVersionList
+                elif codec.startswith("MP4A"):
+                    codec = "AAC"
+
+                codec = CodecEnum[codec]
+
+                bit_depth = None
+                sp = representation.find("SupplementalProperty")
+                if sp is not None:
+                    bit_depth = int(sp.get("value", 0))
+
+                avaliable_tracks.append(
+                    AudioTrack(
+                        asin=track_asin,
+                        codec=codec,
+                        bit_depth=bit_depth,
+                        bitrate=int(
+                            int(representation.get("bandwidth") or 0) // 1000
+                        ),
+                        sample_rate=float(
+                            int(representation.get("audioSamplingRate") or 0) / 1000
+                        ),
+                        url=media_url,
+                        official_quality_name=official_quality_name,
+                        quality_ranking=int(
+                            representation.get("qualityRanking", 0)
+                        ),
+                        quality=quality,
+                        entitlements=PSSHEntitlements(**entitlement_psshs),
+                        web_pssh=web_pssh,
+                        reference_loudness=audio_ref_loudness,
+                    )
+                )
+                
         if not avaliable_tracks:
             raise ValueError("No tracks found!")
 
@@ -1431,3 +1507,18 @@ class ModuleInterface:
             quality_to_track_mapping.update({quality_enum: grouped_tracks})
 
         return quality_to_track_mapping
+
+    @staticmethod
+    def call_shaka_packager(encrypted_file: str, destination_file: str, key_id: str, key: str, label: str):
+        platform = {"win32": "win", "darwin": "osx"}.get(sys.platform, sys.platform)
+        executable = pywidevine.get_binary_path("shaka-packager", f"packager-{platform}", f"packager-{platform}-x64")
+        if not executable:
+            raise EnvironmentError("Shaka Packager executable not found but is required")
+
+        args = [
+            f"input={encrypted_file},stream=0,output={destination_file}",
+            "--enable_raw_key_decryption",
+            f"--keys=label={label}:key_id={key_id}:key={key}",
+            "--quiet"
+        ]
+        subprocess.check_call([executable, *args])

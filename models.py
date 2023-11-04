@@ -41,7 +41,7 @@ class AmazonMusicMobileAPICredentials:
     device_info: dict
     customer_info: dict
     customer_id: typing.Optional[str] = None
-    web_client_config: typing.Optional[AmazonWebConfig] = None
+    web_client_config: AmazonWebConfig = None
 
     def to_dict(self):
         return dataclasses.asdict(self)

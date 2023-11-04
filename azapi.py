@@ -934,14 +934,14 @@ class AmazonMusicMobileAPI:
                 "appInfo": {"musicAgent": music_agent},
                 "contentIdList": content_id_list,
                 "contentProtectionList": [
-                    # "GROUP_PSSH", # for entitlement key
+                    "GROUP_PSSH", # for entitlement key
                     "TRACK_PSSH",  # web playback uses TRACK_PSSH, whereas mobile playback uses GROUP_PSSH
                 ],
                 "customerInfo": {
-                    # "entitlementList": [
-                    #     "HAWKFIRE",
-                    #     "KATANA",
-                    # ],
+                    "entitlementList": [
+                        "HAWKFIRE",
+                        "KATANA",
+                    ],
                     "marketplaceId": self.credentials.web_client_config.marketplace_id,
                     "territoryId": self.credentials.web_client_config.music_territory,
                 },
@@ -1208,6 +1208,8 @@ class AmazonMusicMobileAPI:
                         count=1,
                     )
                 )
+            # import pprint
+            # pprint.pprint(xmltodict.parse(content_response.get("manifest", "")))
 
             yield asin, manifest
         return
