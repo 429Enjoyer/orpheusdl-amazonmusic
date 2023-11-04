@@ -116,7 +116,7 @@ module_information = ModuleInformation(  # Only service_name and module_supporte
     netlocation_constant="amazon",
     test_url="https://music.amazon.com/albums/B08TZPYLJN",
     login_behaviour=ManualEnum.manual,  # setting to ManualEnum.manual disables Orpheus automatically calling login() when needed
-    url_decoding=ManualEnum.manual,  # setting to ManualEnum.manual disables Orpheus' automatic url decoding which works as follows:
+    url_decoding=ManualEnum.manual,
 )
 
 
@@ -524,9 +524,10 @@ class ModuleInterface:
                         key_name = f"{name.upper()}:{self.mobile_session.credentials.web_client_config.music_territory}"
                         if key_name not in self.settings["master_keys"]:
                             continue
-                        
-                        pd.ParseFromString(entitle_pssh.init_data)
+
                         main_key = bytes.fromhex(self.settings["master_keys"][key_name])
+                        if main_key:
+                            pd.ParseFromString(entitle_pssh.init_data)
                         break
                     
                     if not main_key:
@@ -711,7 +712,7 @@ class ModuleInterface:
             all_track_cover_jpg_url=tracks_cover_art,  # technically optional, but HIGHLY recommended
             animated_cover_url="",  # optional
             description="",  # optional
-            quality=f"{best_audio_track.official_quality_name} {codec_data[best_audio_track.codec].pretty_name}",
+            quality=f"{best_audio_track.official_quality_name} {codec_data[best_audio_track.codec].pretty_name} {best_audio_track.bit_depth}bit-{best_audio_track.sample_rate}kHz",
             track_extra_kwargs={
                 "data": track_extra_kwargs
             },  # optional, whatever you want
@@ -1338,33 +1339,19 @@ class ModuleInterface:
             official_quality_name = ""
             audio_ref_loudness = ""
 
-            # Get track type property (LD, SD, HD, SD)
-            if tt := next(
-                (
-                    supplemental_property
-                    for supplemental_property in adaptation_set.findall(
-                        "SupplementalProperty", ns
+            for prop in adaptation_set.findall("SupplementalProperty"):
+                # Get track type property (LD, SD, HD, SD)
+                if prop.get("schemeIdUri") == "amz-music:trackType":
+                    official_quality_name = prop.get("value", "Unknown")
+                    LOGGER.debug(
+                        f"Official name for track: {official_quality_name}"
                     )
-                    if supplemental_property.attrib["schemeIdUri"]
-                    == "amz-music:trackType"
-                ),
-                None,
-            ):
-                official_quality_name = tt.attrib["value"]
+                    continue
 
-            # Get track loudness property
-            if pl := next(
-                (
-                    supplemental_property
-                    for supplemental_property in adaptation_set.findall(
-                        "SupplementalProperty", ns
-                    )
-                    if supplemental_property.attrib["schemeIdUri"]
-                    == "urn:mpeg:mpegB:cicp:ProgramLoudness"
-                ),
-                None,
-            ):
-                audio_ref_loudness = pl.attrib["value"]
+                # Get track loudness property
+                if prop.get("schemeIdUri") == "urn:mpeg:mpegB:cicp:ProgramLoudness":
+                    audio_ref_loudness = prop.get("value", "Unknown")
+                    continue
 
             for representation in adaptation_set.findall("Representation", ns):
                 media_url_elem = representation.find("BaseURL", ns)
