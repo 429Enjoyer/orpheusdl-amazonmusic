@@ -448,8 +448,15 @@ class ModuleInterface:
                 extra_tags=extra_tags,
             )
 
+            valid_album_asins = [album_id]
+            
+            if asin := album_data.get("requestedAsin"):
+                valid_album_asins.append(asin)
+            if asin := album_data.get("globalAsin"):
+                valid_album_asins.append(asin)
+
             cover_url, search_data = self.get_hi_res_cover(
-                asins=(album_id, album_data["requestedAsin"]),
+                asins=valid_album_asins,
                 query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
                 search_data=search_data,
             )
@@ -637,9 +644,16 @@ class ModuleInterface:
         )
         # Force use the ASIN the API returns with
         album_id = album_data["asin"]
+        
+        valid_album_asins = [album_id]
+        
+        if asin := album_data.get("requestedAsin"):
+            valid_album_asins.append(asin)
+        if asin := album_data.get("globalAsin"):
+            valid_album_asins.append(asin)
 
         cover_url, search_data = self.get_hi_res_cover(
-            asins=(album_id, album_data["requestedAsin"]),
+            asins=valid_album_asins,
             query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
             search_data=data.get(f"{album_id}_search"),
         )
@@ -859,8 +873,16 @@ class ModuleInterface:
             if track_id in data
             else self.mobile_session.get_album_info(album_id)
         )
+
+        valid_album_asins = [album_id]
+        
+        if asin := album_data.get("requestedAsin"):
+            valid_album_asins.append(asin)
+        if asin := album_data.get("globalAsin"):
+            valid_album_asins.append(asin)
+
         cover_url, _ = self.get_hi_res_cover(
-            asins=(album_id, album_data["requestedAsin"]),
+            asins=valid_album_asins,
             query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
             search_data=data.get(f"{album_id}_search"),
         )
