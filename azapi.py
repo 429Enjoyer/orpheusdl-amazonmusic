@@ -1163,7 +1163,7 @@ class AmazonMusicMobileAPI:
                             "LabelElement"
                         ):
                             raw_credit_name = str(
-                                " ".join(
+                                "".join(
                                     re.findall(r"[A-Z][^A-Z]*", container_element["text"])
                                 )
                             ).title()
