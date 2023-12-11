@@ -263,10 +263,10 @@ class AmazonMusicMobileAPI:
             except httpx.HTTPError as ce:
                 LOGGER.error(ce)
                 if resp:
-                    LOGGER.error(resp.content)
+                    LOGGER.error(str(resp.content))
                 LOGGER.debug(ce, exc_info=True)
                 last_http_exc = ce
-                time.sleep(10)
+                time.sleep(2)
                 continue
             else:
                 # return the response when successful
@@ -442,7 +442,7 @@ class AmazonMusicMobileAPI:
 
         Example usage:
 
-        `self.mobile_session.get_page("album/B0CDJC65LH", count=0, locale="en_US")
+        `self.mobile_session.get_page("album/B0CDJC65LH", count=0, locale="en_US")`
         """
         if not locale:
             locale = self.credentials.web_client_config.locale
@@ -990,7 +990,7 @@ class AmazonMusicMobileAPI:
         result: list[dict] = resp_dict.get("contentResponseList", [])
         return result
 
-    def get_license_response(self, asin: str, challenge: str) -> str:
+    def get_license_response(self, asin: str, challenge: str, drm_type: typing.Optional[str] = "WIDEVINE") -> str:
         """
         Retrieve a License Response with a License Challenge.
 
@@ -1010,7 +1010,7 @@ class AmazonMusicMobileAPI:
         response = self.post(
             url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/dmls/getLicenseForPlaybackV2",
             data={
-                "DrmType": "WIDEVINE",
+                "DrmType": str(drm_type),
                 "appInfo": {
                     "musicAgent": f"Harley/{self.harley_version} Harley/{self.application_version} ( {str(uuid.uuid4())} {asin} )"
                 },
@@ -1031,7 +1031,7 @@ class AmazonMusicMobileAPI:
         )
 
         if response.status_code != 200:
-            raise Exception(
+            raise ValueError(
                 f"Failed to get license: {response.status_code} {response.text}"
             )
 
@@ -1162,7 +1162,11 @@ class AmazonMusicMobileAPI:
                         if str(container_element.get("interface", "")).endswith(
                             "LabelElement"
                         ):
-                            raw_credit_name = str(container_element["text"]).title()
+                            raw_credit_name = str(
+                                " ".join(
+                                    re.findall(r"[A-Z][^A-Z]*", container_element["text"])
+                                )
+                            ).title()
                             credit_name = (
                                 AmazonMusicMobileAPI.proper_credits_names().get(
                                     raw_credit_name, raw_credit_name

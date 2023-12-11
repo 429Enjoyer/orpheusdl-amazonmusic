@@ -12,6 +12,7 @@ import typing
 import json
 import dataclasses
 import itertools
+import httpx
 from datetime import datetime, timedelta
 import concurrent.futures
 from urllib.parse import urlparse
@@ -22,7 +23,7 @@ import aria2p
 import ffmpeg
 import natsort
 import pywidevine
-from pywidevine import PSSH, Cdm, Device, WidevinePsshData
+from pywidevine import PSSH, Cdm, Device, WidevinePsshData, Key
 from Crypto.Cipher import AES
 
 from tqdm import tqdm
@@ -50,6 +51,7 @@ class PSSHEntitlements:
     """ Amazon Prime subscription tier """
     hawkfire: typing.Optional[PSSH] = None
     """ Free tier """
+    nightwing: typing.Optional[PSSH] = None
     sonic: typing.Optional[PSSH] = None
 
     def to_dict(self):
@@ -304,6 +306,11 @@ class ModuleInterface:
                 )
                 or {}
             )
+            # page_entity_data = (
+            #     dict(data[f"{album_id}_page_entity_data"])
+            #     if data and f"{album_id}_page_entity_data" in data
+            #     else self.mobile_session.get_page(f"album/{album_id}", count=0, locale="en_US").get("entity", {})
+            # )
 
             release_datetime = self._get_date_from_metadata(album_data)
             mapped_audio_tracks = (
@@ -523,7 +530,7 @@ class ModuleInterface:
                 and any(str(item).endswith(self.mobile_session.credentials.web_client_config.music_territory) for item in self.settings["master_keys"])
             ):
                 while True:
-                    pd = WidevinePsshData()
+                    selected_pssh = None
                     main_key: bytes = b""
                     for name, entitle_pssh in audio_track.entitlements.to_dict().items():
                         if not isinstance(entitle_pssh, PSSH):
@@ -534,53 +541,100 @@ class ModuleInterface:
 
                         main_key = bytes.fromhex(self.settings["master_keys"][key_name])
                         if main_key:
-                            pd.ParseFromString(entitle_pssh.init_data)
+                            selected_pssh = entitle_pssh
                         break
                     
-                    if not main_key:
+                    if not (main_key and selected_pssh):
                         break
                     
-                    key_id = pd.entitled_keys[0].key_id.hex()
-                    
-                    LOGGER.debug(f"Using {main_key.hex()} as the master key.")
-                    
-                    cipher = AES.new(main_key, AES.MODE_CBC, pd.entitled_keys[0].iv)
-                    final_key = cipher.decrypt(pd.entitled_keys[0].key)[:16].hex()
-                    LOGGER.debug(f"Final key id and decryption key: '{key_id}:{final_key}'")
+                    key_id, key = self.get_decrypted_key(
+                        enc_key=main_key,
+                        pssh=selected_pssh,
+                        enc_key_type="CONTENT",
+                    )
                     self.call_shaka_packager(
                         encrypted_file=encrypted_track_location,
                         destination_file=decrypted_track_location,
                         key_id=key_id,
-                        key=final_key,
-                        label=audio_track.quality.upper()
+                        key=key,
+                        label=audio_track.official_quality_name
                     )
                     break
                     
+            # Interact with the license server
             if not os.path.exists(decrypted_track_location):
-                # interact with the license server
                 session_id = self.cdm.open()
-                license_challenge = base64.b64encode(
-                    self.cdm.get_license_challenge(
-                        session_id, audio_track.web_pssh, privacy_mode=False
-                    )
-                ).decode("utf-8")
+                
+                used_entitlement: dict[str, PSSH] | None = None
+                for name, pssh_to_test in audio_track.entitlements.to_dict().items():
+                    if not self.cdm.system_id == 9780:
+                        continue
+                    if not pssh_to_test:
+                        continue
+                    license_challenge = base64.b64encode(
+                        self.cdm.get_license_challenge(
+                            session_id, pssh_to_test, privacy_mode=False
+                        )
+                    ).decode("utf-8")
 
-                license_response = self.mobile_session.get_license_response(
-                    asin=audio_track.asin, challenge=license_challenge
-                )
-                if not license_response:
-                    license_response = input(
-                        "License retrieval failed, enter response here (for testing): "
+                    try:
+                        license_response = self.mobile_session.get_license_response(
+                            asin=audio_track.asin, challenge=license_challenge, drm_type="WIDEVINE_ENTITLEMENT"
+                        )
+                    except (ValueError, httpx.HTTPStatusError):
+                        continue
+                    else:
+                        if not license_response:
+                            # license_response = input("License retrieval failed, enter response here (for testing): ")
+                            continue
+                        used_entitlement = {
+                            name: pssh_to_test
+                        }
+                        break
+                else:
+                    license_challenge = base64.b64encode(
+                        self.cdm.get_license_challenge(
+                            session_id, audio_track.web_pssh, privacy_mode=False
+                        )
+                    ).decode("utf-8")
+
+                    license_response = self.mobile_session.get_license_response(
+                        asin=audio_track.asin, challenge=license_challenge, drm_type="WIDEVINE"
                     )
+                    if not license_response:
+                        raise ValueError("Failed to communicate with the license server")
+
 
                 self.cdm.parse_license(session_id, license_response)
+                
+                for key in self.cdm.get_keys(session_id):
+                    if key.type == "ENTITLEMENT":
+                        if not used_entitlement:
+                            continue
 
-                self.cdm.decrypt(
-                    session_id,
-                    encrypted_track_location,
-                    decrypted_track_location,
-                    exists_ok=True,
-                )
+                        name, used_pssh = used_entitlement.popitem()
+                        key_id, dec_key = self.get_decrypted_key(
+                            key.key,
+                            used_pssh,
+                            "CONTENT"
+                        )
+                        key_name = f"{name.upper()}:{self.mobile_session.credentials.web_client_config.music_territory}"
+                        if not self.settings["master_keys"].get("key_name"):
+                            self.print(f"{module_information.service_name}: New entitlement key found! {key_name}:{key.key.hex()}")
+
+                    elif key.type == "CONTENT":
+                        key_id = key.kid.hex
+                        dec_key = key.key.hex()
+                    else:
+                        continue
+                        
+                    self.call_shaka_packager(
+                        encrypted_file=encrypted_track_location,
+                        destination_file=decrypted_track_location,
+                        key_id=key_id,
+                        key=dec_key,
+                        label=audio_track.quality.upper()
+                    )
 
             if not os.path.exists(decrypted_track_location):
                 raise FileNotFoundError("Unable to decrypt the downloaded media file")
@@ -621,8 +675,6 @@ class ModuleInterface:
 
             silentremove(decrypted_track_location)
 
-        # except Exception as e:
-        #     LOGGER.error(e, exc_info=True)
         finally:
             if session_id:
                 self.cdm.close(session_id)
@@ -694,6 +746,7 @@ class ModuleInterface:
             {track["asin"]: track for track in album_data.get("tracks", [])}
             | {album_id: album_data}
             | mapped_tracks
+            # | {f"{album_id}_page_entity_data": self.mobile_session.get_page(f"album/{album_id}", count=0, locale="en_US").get("entity", {})}
         )
 
         if search_data:
@@ -846,7 +899,6 @@ class ModuleInterface:
         self, track_id: str, data={}
     ):  # Mandatory if ModuleModes.credits
         track_credits = self.mobile_session.get_track_xray(track_id, parse_credits=True)
-        LOGGER.debug("Credits: %s", track_credits)
         return [
             CreditsInfo(
                 sanitise_name(k),
@@ -1076,8 +1128,9 @@ class ModuleInterface:
 
     @staticmethod
     def parse_credit_names_from_name(name: str):
+        # Removed ", " due to accidental splitting for artists like "Tyler, The Creator"
         return list(
-            {str(item) for item in re.split(r", | & | - | / | feat. ", name) if item}
+            {str(item) for item in re.split(r" & | - | / | feat. ", name) if item}
         )
 
     @staticmethod
@@ -1134,6 +1187,8 @@ class ModuleInterface:
             # Wait for the download to start
             while not download.is_active or not download.total_length:
                 download.update()
+                if download.error_message:
+                    raise RuntimeError(download.error_code, download.error_message)
 
             # Funny progress bar to maintain consistency
             with tqdm(
@@ -1317,6 +1372,30 @@ class ModuleInterface:
         LOGGER.debug(mapped_audio_tracks)
         return mapped_audio_tracks
     
+    def get_decrypted_key(self, enc_key: bytes, pssh: PSSH, enc_key_type: str):
+        pssh_data = WidevinePsshData()
+        pssh_data.ParseFromString(pssh.init_data)
+        entitled_key = pssh_data.entitled_keys[0]
+
+        LOGGER.debug(f"Using {enc_key.hex()} as the master key.")
+        LOGGER.debug(f"Raw encrypted key ID and key: {entitled_key.key_id.hex()}:{entitled_key.key.hex()}")
+        key_id = entitled_key.key_id.hex()
+        
+        cipher = AES.new(enc_key, AES.MODE_CBC, entitled_key.iv)
+        raw_final_key = cipher.decrypt(entitled_key.key)
+        
+        if enc_key_type == "ENTITLEMENT":
+            final_key = raw_final_key.hex()
+        elif enc_key_type == "CONTENT":
+            final_key = raw_final_key[:16].hex()
+        else:
+            raise ValueError(f"enc_key_type must be ENTITLEMENT or CONTENT, not {enc_key_type}")
+        
+        LOGGER.debug(f"Raw key ({enc_key_type}): {raw_final_key.hex()}, IV: {entitled_key.iv.hex()}")
+
+        return key_id, final_key
+        
+
     def get_audios_from_mpd(self, manifest: ElementTree.Element, track_asin: str):
         """
         Retrieve each avaliable audio quality/format as a AudioTrack.
@@ -1356,7 +1435,7 @@ class ModuleInterface:
                     web_pssh = PSSH(content_protection.find("drm:pssh", ns).text, strict=True)
                     
             if not web_pssh:
-                raise ValueError("Failed to find the PSSH for web playback.")
+                LOGGER.warning("Failed to find the PSSH for web playback. License acquisition may fail.")
             
             official_quality_name = ""
             audio_ref_loudness = ""
