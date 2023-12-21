@@ -39,20 +39,22 @@ from utils.utils import (
     sanitise_name,
 )
 
-from .azapi import AmazonMusicMobileAPI, AmazonMusicMobileAPICredentials
+from .azapi import AmazonMusicMobileAPI, AmazonMusicMobileAPICredentials, AmazonMusicTier
 
 LOGGER = logging.getLogger(__name__)
 
 @dataclasses.dataclass(slots=True)
 class PSSHEntitlements:
     katana: typing.Optional[PSSH] = None
-    """ Unlimited subscription tier """
+    """ Unlimited subscription tier (UHD, HD, SD, LD) """
     robin: typing.Optional[PSSH] = None
     """ Amazon Prime subscription tier """
     hawkfire: typing.Optional[PSSH] = None
-    """ Free tier """
+    """ Free tier (SD) """
     nightwing: typing.Optional[PSSH] = None
+    """ For AAC acquisition (all tiers have this) """
     sonic: typing.Optional[PSSH] = None
+    """ Apart of Prime Music (SD)"""
 
     def to_dict(self):
         return dataclasses.asdict(self)
@@ -128,6 +130,7 @@ class ModuleInterface:
         self.options = module_controller.orpheus_options
         self.module_controller = module_controller
         self.print = module_controller.printer_controller.oprint
+        self.tsc = module_controller.temporary_settings_controller
 
         # Items highest are iterated first
         self.quality_parse = {
@@ -154,6 +157,12 @@ class ModuleInterface:
                 "SPATIAL_RA360",
                 "SPATIAL_ATMOS",
             ]
+        
+        self.tier_parse = {
+            AmazonMusicTier.FREE: QualityEnum.MINIMUM,
+            AmazonMusicTier.PRIME: QualityEnum.HIGH,
+            AmazonMusicTier.UNLIMITED: QualityEnum.HIFI,
+        }
 
         # if not module_controller.orpheus_options.disable_subscription_check and (
         #     self.quality_parse[module_controller.orpheus_options.quality_tier]
@@ -165,24 +174,50 @@ class ModuleInterface:
 
         self.cdm = Cdm.from_device(Device.load(self.settings["wvd_path"]))
 
-        creds = module_controller.temporary_settings_controller.read("credentials")
+        cached_creds = self.tsc.read("credentials") or {}
         credentials = (
-            AmazonMusicMobileAPICredentials.from_dict(creds) if creds else None
+            AmazonMusicMobileAPICredentials.from_dict(
+                cached_creds.get(self.settings.get('country')) or cached_creds[list(cached_creds.keys())[0]]
+                if not AmazonMusicMobileAPICredentials.is_dict_of_instance(cached_creds)
+                else cached_creds
+            ) if cached_creds else None
         )
 
         if credentials:
             self.mobile_session = AmazonMusicMobileAPI(credentials=credentials)
         else:
-            self.login_onto_mobile(self.settings["email"], self.settings["password"])
+            self.mobile_session = self.login_onto_mobile(self.settings["email"], self.settings["password"])
 
         if self.mobile_session.credentials.access_token_expired:
-            self.mobile_session.refresh_access_token()
+            try:
+                self.mobile_session.refresh_access_token()
+            except httpx.HTTPError as he:
+                self.print(f"{module_information.service_name}: This device session/account may be deleted, try deleting loginstorage.bin and logging in again!")
+                raise he
 
-        if credentials != self.mobile_session.credentials:
-            module_controller.temporary_settings_controller.set(
-                "credentials", self.mobile_session.credentials.to_dict()
-            )
+        # if credentials != self.mobile_session.credentials:
+        #     module_controller.temporary_settings_controller.set(
+        #         "credentials", self.mobile_session.credentials.to_dict()
+        #     )
+        
+        # Add support for previous versions of this module
+        if isinstance(cached_creds, dict) and AmazonMusicMobileAPICredentials.is_dict_of_instance(cached_creds):
+            cached_creds = {
+                cached_creds["web_client_config"]["music_territory"]: cached_creds
+            }
+
+        self.tsc.set(
+            "credentials",
+            cached_creds
+            | {
+                self.mobile_session.credentials.web_client_config.music_territory: 
+                self.mobile_session.credentials.to_dict()
+            }
+        )
+        
+
         LOGGER.debug(self.mobile_session.credentials)
+        LOGGER.debug(self.mobile_session.get_account_subscription_tier())
 
     def login_onto_mobile(
         self, email: str, password: str
@@ -204,10 +239,12 @@ class ModuleInterface:
             # die
             raise Exception("Login failed")
 
-        self.mobile_session = mobile_session
         LOGGER.debug(mobile_session._retrieve_capability())
 
-        return self.mobile_session
+        return mobile_session
+    
+    # def select_usable_account(self):
+        
 
     def custom_url_parse(self, link: str) -> MediaIdentification:
         url = urlparse(link)
@@ -334,8 +371,8 @@ class ModuleInterface:
                 mapped_audio_tracks = self.mpd_to_quality_map(mpd, asin)
 
             track_to_use = self._get_usable_audio_track_of_mapped_quailty(
-                mapped_audio_tracks,
-                quality_tier,
+                mapped_audio_tracks=mapped_audio_tracks,
+                quality_tier=QualityEnum(min(quality_tier.value, self.tier_parse[self.mobile_session.get_account_subscription_tier()].value)) if self.options.disable_subscription_check or not self.settings["use_own_master_keys"] else quality_tier,
                 to_print=True,
             )
 
@@ -571,6 +608,8 @@ class ModuleInterface:
                         continue
                     if not pssh_to_test:
                         continue
+                    if f"{name.upper()}_CONTENT" not in self.mobile_session.get_account_subscription_tier().internal_content_tiers:
+                        continue
                     license_challenge = base64.b64encode(
                         self.cdm.get_license_challenge(
                             session_id, pssh_to_test, privacy_mode=False
@@ -582,6 +621,7 @@ class ModuleInterface:
                             asin=audio_track.asin, challenge=license_challenge, drm_type="WIDEVINE_ENTITLEMENT"
                         )
                     except (ValueError, httpx.HTTPStatusError):
+                        self.print(f"{module_information.service_name}: Failed entitlement master key acquisition.")
                         continue
                     else:
                         if not license_response:
@@ -620,7 +660,7 @@ class ModuleInterface:
                         )
                         key_name = f"{name.upper()}:{self.mobile_session.credentials.web_client_config.music_territory}"
                         if not self.settings["master_keys"].get("key_name"):
-                            self.print(f"{module_information.service_name}: New entitlement key found! {key_name}:{key.key.hex()}")
+                            self.print(f'{module_information.service_name}: New entitlement key found! "{key_name}": "{key.key.hex()}"')
 
                     elif key.type == "CONTENT":
                         key_id = key.kid.hex
@@ -1136,7 +1176,7 @@ class ModuleInterface:
     @staticmethod
     def parse_genres_from_genre(name: str):
         return {
-            str(item)
+            str(item).title()
             for item in re.split(r", | & | - | / |/", name)
             if item != "General"
         }

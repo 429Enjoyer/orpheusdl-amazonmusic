@@ -1,7 +1,7 @@
 import dataclasses
 from datetime import datetime, timedelta
 import typing
-
+import enum
 import rsa
 
 
@@ -42,6 +42,7 @@ class AmazonMusicMobileAPICredentials:
     customer_info: dict
     customer_id: typing.Optional[str] = None
     web_client_config: AmazonWebConfig = None
+    tier: "AmazonMusicTier" = None
 
     def to_dict(self):
         return dataclasses.asdict(self)
@@ -59,6 +60,10 @@ class AmazonMusicMobileAPICredentials:
 
         return inst
 
+    @staticmethod
+    def is_dict_of_instance(creds_to_test: dict):
+        return all(name in creds_to_test for name in AmazonMusicMobileAPICredentials.__dataclass_fields__.keys())
+
     @property
     def access_token_expires(self) -> timedelta:
         return self.expires - datetime.now()
@@ -66,3 +71,16 @@ class AmazonMusicMobileAPICredentials:
     @property
     def access_token_expired(self) -> bool:
         return self.expires < datetime.now()
+
+class AmazonMusicTier(enum.Flag):
+    FREE = enum.auto()
+    PRIME = enum.auto()
+    UNLIMITED = enum.auto()
+
+    @property
+    def internal_content_tiers(self):
+        return {
+            AmazonMusicTier.FREE: ["NIGHTWING_CONTENT", "OWNED_CONTENT"],
+            AmazonMusicTier.PRIME: ["ROBIN_CONTENT", "SONIC_CONTENT", "NIGHTWING_CONTENT", "OWNED_CONTENT"],
+            AmazonMusicTier.UNLIMITED: ["KATANA_CONTENT", "HAWKFIRE_CONTENT", "NIGHTWING_CONTENT", "OWNED_CONTENT"]
+        }[self]

@@ -48,7 +48,7 @@ from audible.metadata import encrypt_metadata
 from bs4 import BeautifulSoup
 from Crypto.PublicKey import RSA
 
-from .models import AmazonMusicMobileAPICredentials, AmazonWebConfig
+from .models import AmazonMusicMobileAPICredentials, AmazonWebConfig, AmazonMusicTier
 
 LOGGER = logging.getLogger(__name__)
 
@@ -174,7 +174,7 @@ class AmazonMusicMobileAPI:
             country_code=country_code,
         )
 
-        # authorization_code = self._internal_login(self, oauth_url, email, password)
+        # authorization_code = cls._internal_login(session, oauth_url, email, password)
         authorization_code = cls._exteral_login(oauth_url, application)
 
         items = {
@@ -296,7 +296,6 @@ class AmazonMusicMobileAPI:
                 "accept-charset": "utf-8",
                 "content-type": "application/json; charset=UTF-8",
             } | (headers or {})
-
         request = httpx.Request(
             "POST",
             url,
@@ -309,7 +308,9 @@ class AmazonMusicMobileAPI:
         if sign:
             self._apply_signing_auth_flow(request)
         self._apply_cookies_auth_flow(request)
-        return self._wait_for_response(self.session, request)
+        # LOGGER.debug(vars(request))
+        resp = self._wait_for_response(self.session, request)
+        return resp
 
     def get(self, url: str, headers: typing.Optional[dict] = None) -> httpx.Response:
         if not headers:
@@ -1812,6 +1813,7 @@ class AmazonMusicMobileAPI:
         return auth_device_resp
 
     def _retrieve_capability(self):
+        print(self.credentials)
         response = self.post(
             url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/stratus/",
             headers={
@@ -1820,14 +1822,42 @@ class AmazonMusicMobileAPI:
             },
             data={
                 "capabilityTypes": ["RETRIEVE_ROBIN_CONTENT"],
-                "customerId": None,
+                "customerId": self.credentials.customer_id, # None,
                 "deviceId": self.credentials.device_info["device_serial_number"],
                 "deviceType": AmazonMobileApplication.MUSIC.device_type,
             },
         )
-        resp_json = response.json()
-        LOGGER.debug(f"{response.status_code} {json.dumps(resp_json, indent=4)}")
-        return dict(resp_json)
+        return dict(response.json())
+    
+    @functools.lru_cache()
+    def get_account_status(self):
+        response = self.post(
+            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/stratus/",
+            headers={
+                "x-amz-target": "com.amazon.stratus.StratusServiceExternal.isAccountValid",
+                "x-amzn-requestid": str(uuid.uuid4()),
+            },
+            data={
+                "customerId": self.credentials.customer_id, # None,
+                "deviceId": self.credentials.device_info["device_serial_number"],
+                "deviceType": AmazonMobileApplication.MUSIC.device_type,
+                "ipAddress": None,
+                "verbose": True,
+            },
+        )
+        return dict(response.json())
+    
+    def get_account_subscription_tier(self, resp: typing.Optional[dict] = None):
+        if not resp:
+            resp = self.get_account_status()
+
+        customer_benefits = resp.get("customerAccount", {}).get("customerBenefits", {})
+        if customer_benefits.get("HAWKFIRE_KATANA_ACCESS") == "true" and customer_benefits.get("HAWKFIRE_PLAYBACK_ACCESS") == "true":
+            return AmazonMusicTier.UNLIMITED
+        elif customer_benefits.get("PRIME_MUSIC_BROWSE") == "true" and customer_benefits.get("PRIME_MUSIC_CONTENT_ACCESS") == "true":
+            return AmazonMusicTier.PRIME
+        return AmazonMusicTier.FREE
+        
 
     def _deauthorize_device(self, device_serial: typing.Optional[str]):
         # remove device from authorized devices in amazon music
@@ -1844,13 +1874,15 @@ class AmazonMusicMobileAPI:
                 LOGGER.critical(message)
                 raise Exception(message)
 
+            ref = str(self.credentials.refresh_token)
             body = {
                 "app_name": "Amazon Music",
                 "app_version": "3.56.2",
-                "source_token": self.credentials.refresh_token,
+                "source_token": ref,
                 "requested_token_type": "access_token",
                 "source_token_type": "refresh_token",
             }
+            print(ref)
 
             resp = self.post(
                 f"https://api.amazon.{self.credentials.tld}/auth/token",
@@ -1894,24 +1926,37 @@ class AmazonMusicMobileAPI:
         authorization_code = parsed_url["openid.oa2.authorization_code"][0]
         return authorization_code
 
-    def _internal_login(self, oauth_url: str, email: str, password: str):
-        oauth_resp = self.session.get(oauth_url)
+    @classmethod
+    def _internal_login(cls, session: httpx.Client, oauth_url: str, email: str, password: str):
+        oauth_resp = session.get(oauth_url)
         LOGGER.debug(oauth_resp)
         oauth_soup = get_soup(oauth_resp)
 
         login_inputs = get_inputs_from_soup(oauth_soup)
         login_inputs["email"] = email
         login_inputs["password"] = password
-        metadata = self._get_app_metadata(
-            user_agent=self.USER_AGENT, oauth_url=oauth_url
+        metadata = cls._get_app_metadata(
+            user_agent=cls.USER_AGENT, oauth_url=oauth_url
         )
         login_inputs["metadata1"] = encrypt_metadata(metadata)
         method, url = get_next_action_from_soup(oauth_soup, {"name": "signIn"})
 
-        login_resp = self.session.request(method, url, data=login_inputs)
+        login_resp = session.request(method, url, data=login_inputs)
         login_soup = get_soup(login_resp)
 
         # check for captcha
+        def check_for_captcha(soup: BeautifulSoup) -> bool:
+            """Checks a Amazon login page for a captcha form."""
+
+            captcha = soup.find("img", alt=lambda x: x and ("CAPTCHA" in x or "captcha" in x))
+            return True if captcha else False
+        
+        def extract_captcha_url(soup: BeautifulSoup) -> str | None:
+            """Returns the captcha url from a Amazon login page."""
+
+            captcha = soup.find("img", alt=lambda x: x and ("CAPTCHA" in x or "captcha" in x))
+            return captcha["src"] if captcha else None
+
         while check_for_captcha(login_soup):
             captcha_url = extract_captcha_url(login_soup)
             if not captcha_url:
@@ -1928,7 +1973,8 @@ class AmazonMusicMobileAPI:
 
             method, url = get_next_action_from_soup(login_soup, {"name": "signIn"})
 
-            login_resp = self.session.request(method, url, data=inputs)
+            login_resp = session.request(method, url, data=inputs, timeout=20000)
+            print(vars(login_resp))
             login_soup = get_soup(login_resp)
 
         # check for choice mfa
@@ -1943,7 +1989,8 @@ class AmazonMusicMobileAPI:
 
             method, url = get_next_action_from_soup(login_soup)
 
-            login_resp = self.session.request(method, url, data=inputs)
+            login_resp = session.request(method, url, data=inputs)
+            print(vars(login_resp))
             login_soup = get_soup(login_resp)
 
         # check for mfa (otp_code)
@@ -1957,7 +2004,8 @@ class AmazonMusicMobileAPI:
 
             method, url = get_next_action_from_soup(login_soup)
 
-            login_resp = self.session.request(method, url, data=inputs)
+            login_resp = session.request(method, url, data=inputs)
+            print(vars(login_resp))
             login_soup = get_soup(login_resp)
 
         # check for cvf
@@ -1965,13 +2013,14 @@ class AmazonMusicMobileAPI:
             print(
                 "Check your email or SMS for a code from Amazon and enter it in the below prompt."
             )
+            print(login_soup.find(name="span", attrs={"class": "transaction-approval-word-break"}))
             cvf_code = default_cvf_callback()
 
             inputs = get_inputs_from_soup(login_soup)
 
             method, url = get_next_action_from_soup(login_soup)
 
-            login_resp = self.session.request(method, url, data=inputs)
+            login_resp = session.request(method, url, data=inputs)
             LOGGER.debug("cvf resp: %s, %s", login_resp, login_resp.text)
             login_soup = get_soup(login_resp)
 
@@ -1981,7 +2030,7 @@ class AmazonMusicMobileAPI:
 
             method, url = get_next_action_from_soup(login_soup)
 
-            login_resp = self.session.request(method, url, data=inputs)
+            login_resp = session.request(method, url, data=inputs)
             login_soup = get_soup(login_resp)
 
         # check for approval alert
@@ -1991,13 +2040,13 @@ class AmazonMusicMobileAPI:
             # url = login_soup.find(id="resend-approval-link")["href"]
             url = login_resp.url
 
-            login_resp = self.session.get(url)
+            login_resp = session.get(url)
             login_soup = get_soup(login_resp)
 
             while login_soup.find(
                 "span", {"class": "transaction-approval-word-break"}
             ):  # a-size-base-plus transaction-approval-word-break a-text-bold
-                login_resp = self.session.get(url)
+                login_resp = session.get(url)
                 login_soup = get_soup(login_resp)
                 LOGGER.info("still waiting for redirect")
 
