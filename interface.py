@@ -224,7 +224,7 @@ class ModuleInterface:
             # die
             raise Exception("Login failed")
 
-        LOGGER.debug(mobile_session._retrieve_capability())
+        LOGGER.debug(mobile_session.retrieve_capability())
         self.update_cached_credentials(mobile_session.credentials)
 
         return mobile_session
@@ -363,11 +363,15 @@ class ModuleInterface:
                 new_region = self.select_usable_region_from_regions(AmazonRegion.get_available_regions_by_continent(continent.name))
                 if not new_region:
                     continue
-                # print(f"selected {new_region}")
                 session = self.load_cached_mobile_session(
                     new_region,
                     use_exact_region=True
                 )
+                self.print(
+                    f"{module_information.service_name}: Using a {new_region.pretty_name!r} account "
+                    f"for the region {selected_region.pretty_name!r} as it is unavailable."
+                )
+                
                 selected_region = new_region
                 break
         if not session:
@@ -385,7 +389,7 @@ class ModuleInterface:
             music_territory = AmazonRegion.get_region_by_country(music_territory_name)
         if not music_territory:
             music_territory = AmazonRegion.get_available_regions_by_continent(self.settings["prefer_account_region"])[0]
-        mobile_session, music_territory = self.select_session(music_territory)
+        mobile_session, _ = self.select_session(music_territory)
 
         if not (url.netloc.endswith(mobile_session.credentials.tld)) and not self.settings["use_own_master_keys"]:
             raise ValueError(
@@ -444,10 +448,8 @@ class ModuleInterface:
         media_region: AmazonRegion,
         data: dict = {},
     ) -> TrackInfo:  # Mandatory
-        mobile_session, new_region = self.select_session(media_region)
-        if new_region != media_region:
-            self.print(f"{module_information.service_name}: Using {new_region.country} instead of {media_region.country} for track metadata ({track_id})")
-            media_region = new_region
+        mobile_session, _ = self.select_session(media_region)
+
         if (
             codec_options.spatial_codecs is False
             and not self.settings["force_non_spatial"]
@@ -470,7 +472,7 @@ class ModuleInterface:
                         not self.settings["force_non_spatial"] or self.settings[key]
                         for key in ("prefer_spatial_mha1", "prefer_spatial_ac4")
                     ),
-                    # music_territory="CY"
+                    music_territory=media_region.country
                 )
                 if not (asin and mpd):
                     raise RuntimeError(
@@ -480,20 +482,20 @@ class ModuleInterface:
 
             track_to_use = self._get_usable_audio_track_of_mapped_quailty(
                 mapped_audio_tracks=mapped_audio_tracks,
-                quality_tier=QualityEnum(min(quality_tier.value, self.tier_parse[mobile_session.get_account_subscription_tier()].value)) if self.options.disable_subscription_check or not self.settings["use_own_master_keys"] else quality_tier,
+                quality_tier=QualityEnum(min(quality_tier.value, self.tier_parse[mobile_session.credentials.tier].value)) if self.options.disable_subscription_check or not self.settings["use_own_master_keys"] else quality_tier,
                 to_print=True,
             )
 
             track_data = (
                 data[track_id]
                 if data and track_id in data
-                else mobile_session.get_track_info(track_id) # music_territory="CA"
+                else mobile_session.get_track_info(track_id, media_region=media_region) # music_territory="CA"
             )
             album_id = str(track_data["album"]["asin"])
             album_data = (
                 data[album_id]
                 if data and album_id in data
-                else mobile_session.get_album_info(album_id) # music_territory="NZ"
+                else mobile_session.get_album_info(album_id, media_region=media_region) # music_territory="NZ"
             )
             album_id = str(album_data["asin"])
             
@@ -514,7 +516,7 @@ class ModuleInterface:
                     ),
                     asins=(album_id, track_id, str(track_data["globalAsin"])),
                     search_types=("catalog_album",),
-                    # music_territory="CY"
+                    music_territory=media_region.country
                 )
                 or {}
             )
@@ -536,7 +538,7 @@ class ModuleInterface:
             if len(contributor_asins) > 1:
                 artists.extend(
                     str(item.get("name"))
-                    for item in mobile_session.get_metadata(contributor_asins)[
+                    for item in mobile_session.get_metadata(contributor_asins, music_territory=media_region.country)[
                         "artistList"
                     ]
                     if item.get("name")
@@ -584,7 +586,7 @@ class ModuleInterface:
 
             composers = "; ".join(composers)
 
-            url = f"https://music.amazon.{mobile_session.credentials.tld}/albums/{album_id}?trackAsin={track_id}"
+            url = f"https://music.amazon.{media_region.domain_tld}/albums/{album_id}?trackAsin={track_id}&musicTerritory={media_region.country}"
 
             extra_tags = {
                 "Composer": composers,  # force set the composer tag, because orpheus doesn't handle it
@@ -653,7 +655,8 @@ class ModuleInterface:
                 asins=valid_album_asins,
                 query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
                 search_data=search_data,
-                mobile_session=mobile_session
+                mobile_session=mobile_session,
+                media_region=media_region
             )
             if not cover_url:
                 # Default 600 x 600 cover art
@@ -716,15 +719,16 @@ class ModuleInterface:
             )
 
             decrypted_track_location = f"{create_temp_filename()}.mp4"  # {codec_data[audio_track.codec].container.name}
-            if audio_track.entitlements.music_territory != mobile_session.credentials.web_client_config.music_territory:
+            if audio_track.entitlements.music_territory != media_region.country:
                 self.print(
                     f'{module_information.service_name}: Entitlements are '
                     f'for {audio_track.entitlements.music_territory}, '
-                    f'instead of {mobile_session.credentials.web_client_config.music_territory}'
+                    f'instead of {media_region.country}'
             )
+            # print(audio_track.entitlements.music_territory)
             if (
                 self.settings["use_own_master_keys"]
-                and any(str(item).endswith(mobile_session.credentials.web_client_config.music_territory) for item in self.settings["master_keys"])
+                and any(str(item).endswith(media_region.country) for item in self.settings["master_keys"])
             ):
                 while True:
                     selected_pssh = None
@@ -768,9 +772,9 @@ class ModuleInterface:
                         continue
                     if not pssh_to_test:
                         continue
-                    if f"{name.upper()}_CONTENT" not in mobile_session.get_account_subscription_tier().internal_content_tiers:
+                    if f"{name.upper()}_CONTENT" not in mobile_session.credentials.tier.internal_content_tiers:
                         continue
-                    if audio_track.entitlements.music_territory != mobile_session.credentials.web_client_config.music_territory:
+                    if audio_track.entitlements.music_territory != mobile_session.credentials.account_region.country:
                         continue
                     if name != "hawkfire":
                         continue
@@ -904,13 +908,15 @@ class ModuleInterface:
         if not media_region:
             raise TypeError(f"Invalid selected media region for {album_id}")
         
-        mobile_session, media_region = self.select_session(media_region)
+        mobile_session, _ = self.select_session(media_region)
 
         album_data = dict(
             data[album_id]
             if album_id in data
             else mobile_session.get_album_info(
-                album_id, use_alternative_naming=False
+                album_id,
+                use_alternative_naming=False,
+                music_territory=media_region.country
             )
         )
         # Force use the ASIN the API returns with
@@ -928,6 +934,7 @@ class ModuleInterface:
             query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
             search_data=data.get(f"{album_id}_search"),
             mobile_session=mobile_session,
+            media_region=media_region
         )
         if not cover_url:
             # Default 600 x 600 cover art
@@ -949,7 +956,7 @@ class ModuleInterface:
                     not self.settings["force_non_spatial"] or self.settings[key]
                     for key in ("prefer_spatial_mha1", "prefer_spatial_ac4")
                 ),
-                # music_territory="CY"
+                music_territory=media_region.country
             )
             if mpd
         }
@@ -1012,14 +1019,14 @@ class ModuleInterface:
     ) -> (
         PlaylistInfo
     ):  # Mandatory if either ModuleModes.download or ModuleModes.playlist
-        mobile_session, media_region = self.select_session(media_region)
+        mobile_session, _ = self.select_session(media_region)
 
         p_data = data[playlist_id] if playlist_id in data else {}
 
         if not p_data:
             if len(playlist_id) == 10:
                 # An ASIN
-                p_data = mobile_session.get_catalog_playlist(playlist_id)[
+                p_data = mobile_session.get_catalog_playlist(playlist_id, music_territory=media_region.country)[
                     "playlist"
                 ]
             else:
@@ -1054,11 +1061,11 @@ class ModuleInterface:
     def get_artist_info(
         self, artist_id: str, get_credited_albums: bool, media_region: AmazonRegion, data: dict = {}
     ) -> ArtistInfo:  # Mandatory if ModuleModes.download
-        mobile_session, media_region = self.select_session(media_region)
+        mobile_session, _ = self.select_session(media_region)
 
         # get_credited_albums means stuff like remix compilations the artist was part of
         try:
-            artist_data = mobile_session.get_metadata(artist_id)["artistList"][0]
+            artist_data = mobile_session.get_artist_info(artist_id, music_territory=media_region.country)
         except Exception as e:
             LOGGER.error(e, exc_info=True)
             raise e
@@ -1075,12 +1082,13 @@ class ModuleInterface:
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             futures = {
                 executor.submit(
-                    mobile_session.get_album_info, album["asin"]
+                    mobile_session.get_album_info, album["asin"], music_territory=media_region.country
                 ): album
                 for album in mobile_session.search(
                     query=f'"{artist_name}"',
                     search_types=("catalog_album",),
                     limit=1000,
+                    music_territory=media_region.country
                 )
                 if artist_name in album.get("artistName", "")
             }
@@ -1131,7 +1139,7 @@ class ModuleInterface:
     def get_track_credits(
         self, track_id: str, media_region: AmazonRegion, data={}, **kwargs
     ):  # Mandatory if ModuleModes.credits
-        mobile_session, media_region = self.select_session(media_region)
+        mobile_session, _ = self.select_session(media_region)
         track_credits = mobile_session.get_track_xray(track_id, parse_credits=True)
         return [
             CreditsInfo(
@@ -1148,18 +1156,18 @@ class ModuleInterface:
     def get_track_cover(
         self, track_id: str, cover_options: CoverOptions, media_region: AmazonRegion, data={}, **kwargs
     ) -> CoverInfo:  # Mandatory if ModuleModes.covers
-        mobile_session, media_region = self.select_session(media_region)
+        mobile_session, _ = self.select_session(media_region)
         
         track_data = (
             data[track_id]
             if track_id in data
-            else mobile_session.get_track_info(track_id) #music_territory="CY"
+            else mobile_session.get_track_info(track_id, music_territory=media_region.country) #music_territory="CY"
         )
         album_id = str(track_data["album"]["asin"])
         album_data = (
             data[track_id]
             if track_id in data
-            else mobile_session.get_album_info(album_id) #music_territory="CY"
+            else mobile_session.get_album_info(album_id, music_territory=media_region.country) #music_territory="CY"
         )
 
         valid_album_asins = [album_id]
@@ -1173,7 +1181,8 @@ class ModuleInterface:
             asins=valid_album_asins,
             query=f'"{album_data["artist"]["name"]}" - "{album_data["title"]}"',
             search_data=data.get(f"{album_id}_search"),
-            mobile_session=mobile_session
+            mobile_session=mobile_session,
+            media_region=media_region
         )
         if not cover_url:
             # Default 600 x 600 cover art
@@ -1191,8 +1200,8 @@ class ModuleInterface:
     def get_track_lyrics(
         self, track_id: str, media_region: AmazonRegion, data={}, **kwargs
     ) -> LyricsInfo:  # Mandatory if ModuleModes.lyrics
-        mobile_session, media_region = self.select_session(media_region)
-        track_lyrics_resp = mobile_session.get_track_lyrics(track_id) # music_territory="CY"
+        mobile_session, _ = self.select_session(media_region)
+        track_lyrics_resp = mobile_session.get_track_lyrics(track_id, music_territory=media_region.country) # music_territory="CY"
 
         embedded_lyrics = ""
         synced_lyrics = ""
@@ -1240,7 +1249,10 @@ class ModuleInterface:
         if not results:
             results = list(
                 mobile_session.search(
-                    query=query, search_types=(search_type,), limit=limit
+                    query=query,
+                    search_types=(search_type,),
+                    limit=limit,
+                    music_territory=media_region.country
                 )
             )
 
@@ -1295,6 +1307,7 @@ class ModuleInterface:
         asins: typing.Iterable[str],
         query: str,
         mobile_session: AmazonMusicMobileAPI,
+        media_region: AmazonRegion,
         search_data: typing.Optional[dict] = {},
     ):
         search_data = None
@@ -1307,7 +1320,7 @@ class ModuleInterface:
                 asins=tuple(asins),
                 search_types=("catalog_album",),
                 limit=100,
-                # music_territory="CY"
+                music_territory=media_region.country
             )
 
         cover_url = str(
@@ -1326,9 +1339,10 @@ class ModuleInterface:
                 query=query,
                 search_types=("catalog_playlist",),
                 limit=100,
+                music_territory=media_region.country
             ):
                 p_data = mobile_session.get_catalog_playlist(
-                    p_search_data["seriesAsin"]
+                    p_search_data["seriesAsin"], music_territory=media_region.country
                 )
                 for track in p_data.get("playlist", {}).get("tracks", []):
                     if track.get("metadata", {}).get("albumAsin") not in asins:
