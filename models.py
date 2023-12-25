@@ -107,6 +107,9 @@ class AmazonRegion:
     locale: str
     domain_tld: str
     
+    def to_dict(self):
+        return dataclasses.asdict(self)
+    
     @classmethod
     @functools.lru_cache
     def get_known_regions(cls):
