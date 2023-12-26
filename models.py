@@ -6,29 +6,14 @@ import rsa
 import functools
 import itertools
 
-
-@dataclasses.dataclass(frozen=False)
-class AmazonWebConfig:
-    csrf_token: str
-    csrf_ts: str
-    csrf_rnd: str
-
-    device_id: str
+@dataclasses.dataclass(frozen=False, slots=True)
+class AmazonMusicDevice:
+    device_name: str
+    """ The final name recorded on Amazon's backend"""
+    device_serial_number: str
+    """ The attributed generated serial number """
     device_type: str
-    marketplace_id: str
-    session_id: str
-
-    music_territory: str
-    """ ISO 3166-1 Alpha-2 country code """
-    locale: str
-    """ displayLanguage, ISO 639-1 language code (e.g. en_CA, fr_FR, ja_JP etc.) """
-    region: str
-    """ siteRegion, continent identifier (e.g. NA, EU, FE, etc.) """
-
-    access_token: typing.Optional[str] = None
-    customer_id: str = "A2ZYP8SXGBYADP"  # passed as "" if using cookies.txt
-    user_tld: str = "com"
-
+    """ Always `A1DL2DVDQVK3Q` """
 
 @dataclasses.dataclass(frozen=False, slots=True)
 class AmazonMusicMobileAPICredentials:
@@ -39,11 +24,9 @@ class AmazonMusicMobileAPICredentials:
     expires: datetime
     website_cookies: dict
     store_authentication_cookie: dict
-    tld: str
-    device_info: dict
     customer_info: dict
+    device_info: AmazonMusicDevice
     customer_id: typing.Optional[str] = None
-    web_client_config: AmazonWebConfig = None
     tier: "AmazonMusicTier" = None
     account_region: "AmazonRegion" = None
 
@@ -52,15 +35,16 @@ class AmazonMusicMobileAPICredentials:
 
     @classmethod
     def from_dict(cls, creds_dict: dict):
-        web_client_config = None
-        if web_client_config_dict := creds_dict.get("web_client_config"):
-            web_client_config = AmazonWebConfig(**web_client_config_dict)
-            # creds_dict.pop("web_client_config")
-            creds_dict.update({"web_client_config": web_client_config})
+        # deprecrate some configs
+        creds_dict.pop("web_client_config", None)
+        creds_dict.pop("tld", None)
+
         if account_region_dict := creds_dict.get("account_region"):
             account_region = AmazonRegion(**account_region_dict)
             creds_dict.update({"account_region": account_region})
-
+        if device_dict := creds_dict.get("device_info"):
+            device_dict = AmazonMusicDevice(**device_dict)
+            creds_dict.update({"device_info": device_dict})
 
         inst = cls(**creds_dict)
 

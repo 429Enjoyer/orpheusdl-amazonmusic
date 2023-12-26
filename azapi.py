@@ -12,6 +12,7 @@ import time
 import typing
 import uuid
 import concurrent.futures
+import pprint
 from datetime import datetime, timedelta
 from enum import Enum, auto
 from urllib.parse import parse_qs, urlencode
@@ -48,7 +49,7 @@ from audible.metadata import encrypt_metadata
 from bs4 import BeautifulSoup
 from Crypto.PublicKey import RSA
 
-from .models import AmazonMusicMobileAPICredentials, AmazonWebConfig, AmazonMusicTier, AmazonRegion, AmazonContinent
+from .models import AmazonMusicDevice, AmazonMusicMobileAPICredentials, AmazonMusicTier, AmazonRegion, AmazonContinent
 
 LOGGER = logging.getLogger(__name__)
 
@@ -95,7 +96,7 @@ class AmazonMobileApplication(Enum):
 class AmazonMusicMobileAPI:
     """Amazon Music API"""
 
-    application_version = "23.7.0"
+    application_version = "22.15.12"
     harley_version = "3.12.3.86"
 
     HARLEY_USER_AGENT = f"Harley/{harley_version} {AmazonMobileApplication.MUSIC.device_type}/{application_version}"
@@ -115,17 +116,18 @@ class AmazonMusicMobileAPI:
         self.credentials = credentials
         self.session = self._create_httpx_session()
         self.session.cookies.update(credentials.website_cookies)
-        # del self.credentials.web_client_config
-        if not self.credentials.web_client_config:
-            self.credentials.web_client_config = self._get_web_client_configuration(
-                self.credentials.tld,
-                self.parse_for_app_config(self.get_root(self.credentials.tld)),
-            )
+        # if not self.credentials.web_client_config:
+        #     self.credentials.web_client_config = self._get_web_client_configuration(
+        #         self.credentials.account_region.domain_tld,
+        #         self.parse_for_app_config(self.get_root(self.credentials.account_region.domain_tld)),
+        #     )
         
         if not self.credentials.account_region:
-            self.credentials.account_region = AmazonRegion.get_region_by_country(credentials.web_client_config.music_territory)
-        if self.credentials.account_region and self.credentials.web_client_config.region != self.credentials.account_region.region.name:
-            self.credentials.web_client_config.region = self.credentials.account_region.region.name
+            self.credentials.account_region = AmazonRegion.get_region_by_country(
+                dict(self.get_account_status()).get("customerAccount", {}).get("accountInfo", {}).get("musicTerritory", "")
+            )
+        # if self.credentials.account_region and self.credentials.web_client_config.region != self.credentials.account_region.region.name:
+        #     self.credentials.web_client_config.region = self.credentials.account_region.region.name
         
         # Always update the tier on instance creation
         self.credentials.tier = self.get_account_subscription_tier()
@@ -147,18 +149,20 @@ class AmazonMusicMobileAPI:
                 f"Country code must be a ISO 3166-1 alpha-2 value!, got: {country_code}"
             )
         selected_region = AmazonRegion.get_region_by_country(country_code)
+        application = application or AmazonMobileApplication.MUSIC
+        
         session = cls._create_httpx_session()
 
-        if country_code == "JP":
+        if country_code == "JP" and application is not AmazonMobileApplication.PRIME_VIDEO:
             # Login to Prime Video first, because amazon.
             session = cls.login_via_mobile(
                 email=email,
                 password=password,
                 load_credentials=False,
                 application=AmazonMobileApplication.PRIME_VIDEO,
+                country_code=country_code,
             )
 
-        application = application or AmazonMobileApplication.MUSIC
 
         base_url = f"https://amazon.{selected_region.domain_tld}"
         init_cookies = cls._build_init_cookies()
@@ -167,7 +171,7 @@ class AmazonMusicMobileAPI:
         session.cookies.update(init_cookies)
 
         code_verifier = create_code_verifier()
-
+        
         oauth_url, serial = cls._build_oauth_url(
             domain="com",
             code_verifier=code_verifier,
@@ -182,14 +186,17 @@ class AmazonMusicMobileAPI:
         items = {
             "authorization_code": authorization_code,
             "code_verifier": code_verifier,
-            "domain": selected_region.domain_tld,
             "serial": serial,
         }
 
         if not load_credentials:
             return session
 
-        inst = cls.register(application=application, **items)
+        inst = cls.register(
+            application=application,
+            selected_region=selected_region,
+            **items
+        )
         print(
             f"Login confirmed for {inst.credentials.customer_info.get('name', 'Unknown user')} in {selected_region.pretty_name} on {application.official_name}"
         )
@@ -205,12 +212,12 @@ class AmazonMusicMobileAPI:
         #     "customerInfo": {
         #         "customerId": "", #the value is not set, but it is required
         #         "deviceId": serial,
-        #         "deviceType": self.credentials.device_info["device_type"],
+        #         "deviceType": self.credentials.device_info.device_type,
         #     },
         #     "deviceId": serial,
-        #     "deviceType": self.credentials.device_info["device_type"],
+        #     "deviceType": self.credentials.device_info.device_type,
         #     "targetDeviceId": serial,
-        #     "targetDeviceType": self.credentials.device_info["device_type"],
+        #     "targetDeviceType": self.credentials.device_info.device_type,
         # }, headers={
         #     'x-amz-target': 'com.amazon.stratus.StratusServiceExternal.retrieveDevice',
         #     'x-amzn-RequestId': str(uuid.uuid4()),
@@ -375,7 +382,7 @@ class AmazonMusicMobileAPI:
                 "currencyOfPreference": None,
                 "customerIP": None,
                 "customerId": None,
-                "deviceId": self.credentials.device_info["device_serial_number"],
+                "deviceId": self.credentials.device_info.device_serial_number,
                 "deviceType": AmazonMobileApplication.MUSIC.device_type,
                 "features": [
                     "ownership",
@@ -471,7 +478,7 @@ class AmazonMusicMobileAPI:
                 "customerIP": None,
                 "customerId": None,
                 "debug": None,  # set to True for.. a new errors attribute.
-                "deviceId": self.credentials.device_info["device_serial_number"],
+                "deviceId": self.credentials.device_info.device_serial_number,
                 "deviceType": AmazonMobileApplication.MUSIC.device_type,
                 "ipAddress": None,
                 "languagesOfPerformance": None,
@@ -584,7 +591,7 @@ class AmazonMusicMobileAPI:
         data = {
             "customerIdentity": {
                 "customerId": self.credentials.customer_id,
-                "deviceId": self.credentials.device_info["device_serial_number"],
+                "deviceId": self.credentials.device_info.device_serial_number,
                 "deviceType": AmazonMobileApplication.MUSIC.device_type,
                 "musicRequestIdentityContextToken": None,
                 "sessionId": "123-1234567-5555555",  # this is legit what the app uses :skull:
@@ -670,7 +677,7 @@ class AmazonMusicMobileAPI:
                 "contentEncoding": True,
                 "customerInfo": {
                     "customerId": "",
-                    "deviceId": self.credentials.device_info["device_serial_number"],
+                    "deviceId": self.credentials.device_info.device_serial_number,
                     "deviceType": AmazonMobileApplication.MUSIC.device_type,
                 },
                 "musicTerritory": region_to_use.country,
@@ -687,7 +694,7 @@ class AmazonMusicMobileAPI:
         """
 
         resp = self.post(
-            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/playlists/",
+            url=f"https://music.amazon.{self.credentials.account_region.domain_tld}/{self.credentials.account_region.region.name}/api/playlists/",
             headers={
                 "x-amz-target": "com.amazon.musicplaylist.model.MusicPlaylistService.getPlaylistsByIdV2",
                 "User-Agent": self.APP_USER_AGENT,
@@ -697,7 +704,7 @@ class AmazonMusicMobileAPI:
                 "contentEncoding": True,
                 "customerInfo": {
                     "customerId": "",
-                    "deviceId": self.credentials.device_info["device_serial_number"],
+                    "deviceId": self.credentials.device_info.device_serial_number,
                     "deviceType": AmazonMobileApplication.MUSIC.device_type,
                 },
                 "featureSet": ["SUPPORT_MIXED_ID_TYPES", "INCLUDE_FOLLOWER_COUNT"],
@@ -779,7 +786,7 @@ class AmazonMusicMobileAPI:
         """
         Get the logged in user's recent tracks.
         """
-        url = f"https://music.amazon.{self.credentials.tld}/api/nimbly/"
+        url = f"https://music.amazon.{self.credentials.account_region.domain_tld}/api/nimbly/"
         headers = {
             "x-amz-target": "com.amazon.nimblymusicservice.NimblyMusicService.GetRecentTrackActivity",
             "User-Agent": self.APP_USER_AGENT,
@@ -789,14 +796,14 @@ class AmazonMusicMobileAPI:
             # "activityTypeFilters": ["PLAYED"],
             "allowedParentalControls": None,
             "customerId": None,
-            "deviceId": self.credentials.device_info["device_serial_number"],
+            "deviceId": self.credentials.device_info.device_serial_number,
             "deviceType": AmazonMobileApplication.MUSIC.device_type,
             "features": ["HIGHQUALITY"],
             "languageLocale": None,
             "marketplaceId": None,
             "musicRequestIdentityContext": None,
             "musicRequestIdentityContextToken": None,
-            "musicTerritory": self.credentials.web_client_config.music_territory,
+            "musicTerritory": self.credentials.account_region.country,
             "pageToken": "",
         }
         resp = self.post(url=url, headers=headers, data=data, sign=True)
@@ -949,12 +956,12 @@ class AmazonMusicMobileAPI:
                 },
                 "customerId": self.credentials.customer_id,
                 "deviceToken": {
-                    "deviceId": self.credentials.device_info["device_serial_number"],
+                    "deviceId": self.credentials.device_info.device_serial_number,
                     "deviceTypeId": AmazonMobileApplication.MUSIC.device_type,
                 },
                 "musicDashVersionList": [
                     # dash_version,
-                    # "SIREN", # needs bitrateTypeList so maybe used in the windows app?
+                    # "SIREN", # only HAWKFIRE, incompatible with SIREN_KATANA parsing.
                     "SIREN_KATANA",  # with 360 audio, but keeps on getting invalid key size (with group_pssh)? PSSH Entitled key size is always 32 bytes, not sure why (brings error if used)
                     # "SIREN_KATANA_NO_CLEAR_LEAD", #this and no entitlement, is what is used by Amazon Music Web
                     # "V2", # for obtaining legacy AAC audio
@@ -1013,14 +1020,14 @@ class AmazonMusicMobileAPI:
         Entitlement is not possible without the proper widevine device, 9480
         """
         response = self.post(
-            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/dmls/getLicenseForPlaybackV2",
+            url=f"https://music.amazon.{self.credentials.account_region.domain_tld}/{self.credentials.account_region.region.name}/api/dmls/getLicenseForPlaybackV2",
             data={
                 "DrmType": str(drm_type),
                 "appInfo": {
                     "musicAgent": f"Harley/{self.harley_version} Harley/{self.application_version} ( {str(uuid.uuid4())} {asin} )"
                 },
                 "deviceToken": {
-                    "deviceId": self.credentials.device_info["device_serial_number"],
+                    "deviceId": self.credentials.device_info.device_serial_number,
                     "deviceTypeId": AmazonMobileApplication.MUSIC.device_type,
                 },
                 "licenseChallenge": challenge,
@@ -1030,8 +1037,8 @@ class AmazonMusicMobileAPI:
                 "User-Agent": self.USER_AGENT,
                 "X-Amz-requestid": str(uuid.uuid4()),
                 "X-Amz-Target": "com.amazon.digitalmusiclocator.DigitalMusicLocatorServiceExternal.getLicenseForPlaybackV2",
-                "Origin": f"https://music.amazon.{self.credentials.tld}",
-                "Referer": f"https://music.amazon.{self.credentials.tld}/",
+                "Origin": f"https://music.amazon.{self.credentials.account_region.domain_tld}",
+                "Referer": f"https://music.amazon.{self.credentials.account_region.domain_tld}/",
             },
         )
 
@@ -1073,12 +1080,10 @@ class AmazonMusicMobileAPI:
 
     def get_track_xray(self, asin: str, parse_credits: typing.Optional[bool] = False):
         response = self.post(
-            url=f"https://{str(self.credentials.web_client_config.region).lower()}.mobilemesk.skill.music.a2z.com/api/showXray/{asin}",
+            url=f"https://{str(self.credentials.account_region.region.name).lower()}.mobilemesk.skill.music.a2z.com/api/showXray/{asin}",
             add_default_stratus_headers=False,
             headers={
-                "x-amzn-device-id": self.credentials.device_info[
-                    "device_serial_number"
-                ],
+                "x-amzn-device-id": self.credentials.device_info.device_serial_number,
                 "x-amzn-device-family": "MobileAndroid",
                 "x-amzn-device-manufacturer": "Google",
                 "x-amzn-device-model": "Pixel 5",
@@ -1222,14 +1227,29 @@ class AmazonMusicMobileAPI:
             yield asin, manifest
         return
 
+    @staticmethod
+    def _create_httpx_session():
+        default_headers = {
+            "User-Agent": AmazonMusicMobileAPI.USER_AGENT,
+            "Accept-Language": "en-US",
+            "Accept-Encoding": "gzip",
+            "x-requested-with": "com.amazon.mp3",
+        }
+
+        session = httpx.Client(
+            headers=default_headers,
+            follow_redirects=True,
+        )
+        return session
+
     @classmethod
     def register(
         cls,
+        application: AmazonMobileApplication,
+        selected_region: AmazonRegion,
         authorization_code: str,
         code_verifier: bytes,
-        domain: str,
         serial: str,
-        application: AmazonMobileApplication,
     ):
         """Registers a dummy Amazon device for Amazon Music.
 
@@ -1244,7 +1264,7 @@ class AmazonMusicMobileAPI:
 
         """
 
-        device_name = f"ripperino {os.urandom(16).hex()} - Android Device (MP3)"
+        device_name = f"ripperino {os.urandom(16).hex()} Android Device (MP3)"
         LOGGER.debug(f"Registering device {device_name} with serial {serial}")
 
         body = {
@@ -1254,7 +1274,7 @@ class AmazonMusicMobileAPI:
                 "website_cookies",
                 "store_authentication_cookie",
             ],
-            "cookies": {"website_cookies": [], "domain": f".amazon.{domain}"},
+            "cookies": {"website_cookies": [], "domain": f".amazon.{selected_region.domain_tld}"},
             "registration_data": {
                 "domain": "Device",
                 "app_version": cls.application_version,
@@ -1262,7 +1282,7 @@ class AmazonMusicMobileAPI:
                 "device_type": application.device_type,
                 "device_name": device_name,
                 "os_version": "11",
-                "software_version": "522151214",
+                "software_version": "523160014",
                 "device_model": "Pixel 5",
                 "app_name": application.official_name,
             },
@@ -1277,25 +1297,25 @@ class AmazonMusicMobileAPI:
             "requested_extensions": ["device_info", "customer_info"],
         }
 
-        resp = httpx.post(f"https://api.amazon.{domain}/auth/register", json=body)
+        resp = httpx.post(f"https://api.amazon.{selected_region.domain_tld}/auth/register", json=body)
 
         LOGGER.debug(json.dumps(resp.json(), indent=4))
         resp_json = resp.json()
         if resp.status_code != 200:
-            raise Exception(resp_json)
+            raise ValueError(resp_json)
+        # pprint.pprint(vars(resp))
 
         success_response = resp_json["response"]["success"]
 
         tokens = dict(success_response["tokens"])
         adp_token = tokens["mac_dms"]["adp_token"]
-        device_private_key = str(tokens["mac_dms"]["device_private_key"])
-
+        device_private_key = tokens["mac_dms"]["device_private_key"]
         pem_prefix = "-----BEGIN RSA PRIVATE KEY-----\n"
         pem_suffix = "\n-----END RSA PRIVATE KEY-----"
-        if not device_private_key.startswith(
+        if not str(device_private_key).startswith(
             pem_prefix
-        ) and not device_private_key.endswith(pem_suffix):
-            key = RSA.import_key(base64.b64decode(device_private_key))
+        ) and not str(device_private_key).endswith(pem_suffix):
+            key = RSA.import_key(base64.b64decode(str(device_private_key)))
             device_private_key = rsa.PrivateKey.load_pkcs1(key.export_key("PEM"))
         else:
             key = rsa.PrivateKey.load_pkcs1(device_private_key)
@@ -1307,15 +1327,8 @@ class AmazonMusicMobileAPI:
         expires = datetime.utcnow() + timedelta(seconds=expires_s)
 
         extensions = success_response["extensions"]
-        device_info = dict(extensions["device_info"])
+        device_info = AmazonMusicDevice(**dict(extensions["device_info"]))
         customer_info = dict(extensions["customer_info"])
-
-        web_client_config: AmazonWebConfig = cls._get_web_client_configuration(domain)
-
-        # Confirm home region is valid
-
-        if customer_info["home_region"] != web_client_config.region:
-            customer_info.update({"home_region": web_client_config.region})
 
         website_cookies = {
             cookie["Name"]: str(cookie["Value"]).replace(r'"', r"")
@@ -1332,56 +1345,9 @@ class AmazonMusicMobileAPI:
             store_authentication_cookie=store_authentication_cookie,
             device_info=device_info,
             customer_info=customer_info,
-            tld=domain,
         )
 
         return cls(credentials)
-
-    @staticmethod
-    def _create_httpx_session():
-        default_headers = {
-            "User-Agent": AmazonMusicMobileAPI.USER_AGENT,
-            "Accept-Language": "en-US",
-            "Accept-Encoding": "gzip",
-            "x-requested-with": "com.amazon.mp3",
-        }
-
-        session = httpx.Client(
-            headers=default_headers,
-            follow_redirects=True,
-        )
-        return session
-
-    @staticmethod
-    def _get_web_client_configuration(tld: str, app_conf: typing.Optional[dict] = None):
-        if not app_conf:
-            app_conf = AmazonMusicMobileAPI.parse_for_app_config(
-                AmazonMusicMobileAPI._wait_for_response(
-                    AmazonMusicMobileAPI._create_httpx_session(),
-                    httpx.Request(
-                        "GET",
-                        url=f"https://music.amazon.{tld}",
-                        headers={"User-Agent": AmazonMusicMobileAPI.USER_AGENT},
-                    ),
-                ).text
-            )
-
-        web_client_config = AmazonWebConfig(
-            access_token=app_conf["accessToken"],
-            csrf_token=app_conf["csrf"]["token"],
-            csrf_rnd=app_conf["csrf"]["rnd"],
-            csrf_ts=app_conf["csrf"]["ts"],
-            device_id=app_conf["deviceId"],
-            device_type=app_conf["deviceType"],
-            customer_id=app_conf["customerId"],
-            marketplace_id=app_conf["marketplaceId"],
-            session_id=app_conf["sessionId"],
-            music_territory=app_conf["musicTerritory"],
-            locale=app_conf["displayLanguage"],
-            region=app_conf["siteRegion"],
-            user_tld=tld,
-        )
-        return web_client_config
 
     @staticmethod
     def _build_client_id(
@@ -1409,7 +1375,8 @@ class AmazonMusicMobileAPI:
                 "SHA-256": [
                     "2f19adeb284eb36f7f07786152b9a1d14b21653203ad0b04ebbf9c73ab6d7625"
                 ],
-                "app_version": "522151214",
+                # https://www.apkmirror.com/apk/amazon-mobile-llc/amazon-music-discover-songs/amazon-music-discover-songs-22-15-12-release/amazon-music-songs-podcasts-22-15-12-4-android-apk-download/
+                "app_version": "523160014",
                 "app_version_name": AmazonMusicMobileAPI.application_version,
                 "app_sms_hash": "QGCBba+brC5",
                 "map_version": amzn_app_id,
@@ -1470,9 +1437,12 @@ class AmazonMusicMobileAPI:
             "openid.ns": "http://specs.openid.net/auth/2.0",
             "forceMobileLayout": "true",  # custom, unsure if required by azm or is useless
         }
-        if selected_region.region is not AmazonContinent.NA:
+        if (
+            selected_region.region is not AmazonContinent.NA 
+            and selected_region.country not in ("AU")
+        ) :
             # TODO, find which countries that require to login into prime video first
-            # NOTE: amz music australia hates the marketplace id in the oauth url
+            # NOTE: amz music australia hates the marketplace id in the oauth url (404)
             oauth_params.update({"marketPlaceId": selected_region.marketplace_id})
 
         return f"{base_url}?{urlencode(oauth_params)}", serial
@@ -1481,8 +1451,8 @@ class AmazonMusicMobileAPI:
     def _now_to_unix_ms() -> int:
         return math.floor(datetime.now().timestamp() * 1000)
 
-    @staticmethod
-    def _get_app_metadata(user_agent: str, oauth_url: str) -> str:
+    @classmethod
+    def _get_app_metadata(cls) -> str:
         """
         Returns json-formatted metadata to simulate sign-in from an Android Amazon Music app.
         """
@@ -1509,7 +1479,7 @@ class AmazonMusicMobileAPI:
                 "captchainput": 0,
                 "pow": 0,
             },
-            "start": 1672106376599,
+            "start": cls._now_to_unix_ms(),
             "interaction": {
                 "clicks": 1,
                 "touches": 1,
@@ -1566,34 +1536,34 @@ class AmazonMusicMobileAPI:
             "battery": {},
             "performance": {
                 "timing": {
-                    "navigationStart": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "navigationStart": cls._now_to_unix_ms(),
                     "unloadEventStart": 0,
                     "unloadEventEnd": 0,
                     "redirectStart": 0,
                     "redirectEnd": 0,
-                    "fetchStart": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "domainLookupStart": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "domainLookupEnd": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "connectStart": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "connectEnd": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "secureConnectionStart": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "requestStart": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "responseStart": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "responseEnd": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "domLoading": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "domInteractive": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "domContentLoadedEventStart": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "domContentLoadedEventEnd": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "domComplete": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "loadEventStart": AmazonMusicMobileAPI._now_to_unix_ms(),
-                    "loadEventEnd": AmazonMusicMobileAPI._now_to_unix_ms(),
+                    "fetchStart": cls._now_to_unix_ms(),
+                    "domainLookupStart": cls._now_to_unix_ms(),
+                    "domainLookupEnd": cls._now_to_unix_ms(),
+                    "connectStart": cls._now_to_unix_ms(),
+                    "connectEnd": cls._now_to_unix_ms(),
+                    "secureConnectionStart": cls._now_to_unix_ms(),
+                    "requestStart": cls._now_to_unix_ms(),
+                    "responseStart": cls._now_to_unix_ms(),
+                    "responseEnd": cls._now_to_unix_ms(),
+                    "domLoading": cls._now_to_unix_ms(),
+                    "domInteractive": cls._now_to_unix_ms(),
+                    "domContentLoadedEventStart": cls._now_to_unix_ms(),
+                    "domContentLoadedEventEnd": cls._now_to_unix_ms(),
+                    "domComplete": cls._now_to_unix_ms(),
+                    "loadEventStart": cls._now_to_unix_ms(),
+                    "loadEventEnd": cls._now_to_unix_ms(),
                 }
             },
             "automation": {
                 "wd": {"properties": {"document": [], "window": [], "navigator": []}},
                 "phantom": {"properties": {"window": []}},
             },
-            "end": 1672106405750,
+            "end": cls._now_to_unix_ms() + 29151, # add some delay
             "timeZone": -5,
             "flashVersion": None,
             "plugins": "unknown||412-732-732-24-*-*-*",
@@ -1704,23 +1674,53 @@ class AmazonMusicMobileAPI:
         }
         return json.dumps(meta_dict, separators=(",", ":"))
 
-    def _apply_signing_auth_flow(self, request: httpx.Request) -> None:
-        # headers = sign_request(
-        #     method=request.method,
-        #     path=request.url.raw_path.decode(),
-        #     body=request.content,
-        #     adp_token=self.credentials.adp_token,
-        #     private_key=self.credentials.device_private_key
-        # )
+    def refresh_access_token(self, force: bool = False) -> None:
+        """
+        Refresh the access token
 
+        """
+        if force or self.credentials.access_token_expired:
+            if self.credentials.refresh_token is None:
+                message = "No refresh token found. Can't refresh access token."
+                LOGGER.critical(message)
+                raise Exception(message)
+
+            body = {
+                "app_name": "Amazon Music",
+                "app_version": self.application_version,
+                "source_token": self.credentials.refresh_token,
+                "requested_token_type": "access_token",
+                "source_token_type": "refresh_token",
+            }
+
+            resp = self.post(
+                f"https://api.amazon.{self.credentials.account_region.domain_tld}/auth/token",
+                data=body,
+                sign=False,
+            )
+            resp_dict = resp.json()
+            resp.raise_for_status()
+
+            expires = datetime.utcnow() + timedelta(
+                seconds=int(resp_dict["expires_in"])
+            )
+
+            self.credentials.access_token = resp_dict["access_token"]
+            self.credentials.expires = expires
+
+        else:
+            LOGGER.info(
+                "Access Token not expired. No refresh necessary. "
+                "To force refresh please use force=True"
+            )
+
+    def _apply_signing_auth_flow(self, request: httpx.Request) -> None:
         date = datetime.utcnow().isoformat("T") + "Z"
         body = request.content.decode("utf-8")
 
         data = f"{request.method}\n{request.url.raw_path.decode()}\n{date}\n{body}\n{self.credentials.adp_token}"
 
-        key = self.credentials.device_private_key
-
-        cipher = rsa.pkcs1.sign(data.encode(), key, "SHA-256")
+        cipher = rsa.pkcs1.sign(data.encode(), self.credentials.device_private_key, "SHA-256")
         signed_encoded = base64.b64encode(cipher)
 
         signature = f"{signed_encoded.decode()}:{date}"
@@ -1734,25 +1734,22 @@ class AmazonMusicMobileAPI:
         # LOGGER.debug(headers)
 
         request.headers.update(headers)
-        LOGGER.debug("signing auth flow applied to request")
+        LOGGER.debug("Signing auth flow applied to request")
 
     def _apply_cookies_auth_flow(self, request: httpx.Request) -> None:
         if not self.credentials:
             raise ValueError("You must login first!")
-        cookies = {
-            name: value for (name, value) in self.credentials.website_cookies.items()
-        }
 
-        httpx.Cookies(cookies).set_cookie_header(request)
-        LOGGER.debug("cookies auth flow applied to request")
+        httpx.Cookies(self.credentials.website_cookies).set_cookie_header(request)
+        LOGGER.debug("Cookies auth flow applied to request")
 
     def _list_devices(self):
         devices_resp = self.post(
-            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/stratus/",
+            url=f"https://music.amazon.{self.credentials.account_region.domain_tld}/{self.credentials.account_region.region.name}/api/stratus/",
             data={
                 "customerId": None,
-                "deviceId": self.credentials.device_info["device_serial_number"],
-                "deviceType": self.credentials.device_info["device_type"],
+                "deviceId": self.credentials.device_info.device_serial_number,
+                "deviceType": self.credentials.device_info.device_type,
             },
             headers={
                 "x-amz-target": "com.amazon.stratus.StratusServiceExternal.listDevicesByCustomerId",
@@ -1767,21 +1764,19 @@ class AmazonMusicMobileAPI:
     def authorize_device(
         self,
         device_serial: typing.Optional[str] = None,
-        device_type: typing.Optional[str] = None,
         home_region: typing.Optional[str] = None,
         domain: typing.Optional[str] = None,
     ):
-        if not device_type:
-            device_type = AmazonMobileApplication.MUSIC.device_type
+        device_type = AmazonMobileApplication.MUSIC.device_type
 
         if not device_serial:
-            device_serial = self.credentials.device_info["device_serial_number"]
+            device_serial = self.credentials.device_info.device_serial_number
 
         if not home_region:
-            home_region = self.credentials.customer_info["home_region"]
+            home_region = self.credentials.account_region.region.name
 
         if not domain:
-            domain = self.credentials.tld
+            domain = self.credentials.account_region.domain_tld
 
         auth_device_resp = self.post(
             url=f"https://music.amazon.{domain}/{home_region}/api/stratus/",
@@ -1789,6 +1784,8 @@ class AmazonMusicMobileAPI:
                 "capabilities": [
                     "RETRIEVE_OWNED_CONTENT",
                     "RETRIEVE_ROBIN_CONTENT",
+                    # "RETRIEVE_MERCURY_CONTENT",
+                    # "RETRIEVE_NIGHTWING_CONTENT",
                 ],
                 "customerInfo": {
                     "customerId": "",  # it is not set, but it is required
@@ -1813,17 +1810,19 @@ class AmazonMusicMobileAPI:
         return auth_device_resp
 
     def retrieve_capability(self):
-        # print(self.credentials)
         response = self.post(
-            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/stratus/",
+            url=f"https://music.amazon.{self.credentials.account_region.domain_tld}/{self.credentials.account_region.region.name}/api/stratus/",
             headers={
                 "x-amz-target": "com.amazon.stratus.StratusServiceExternal.retrieveCapability",
                 "x-amzn-requestid": str(uuid.uuid4()),
             },
             data={
-                "capabilityTypes": ["RETRIEVE_ROBIN_CONTENT"],
+                "capabilityTypes": [
+                    "RETRIEVE_ROBIN_CONTENT",
+                    # "RETRIEVE_OWNED_CONTENT",
+                ],
                 "customerId": self.credentials.customer_id, # None,
-                "deviceId": self.credentials.device_info["device_serial_number"],
+                "deviceId": self.credentials.device_info.device_serial_number,
                 "deviceType": AmazonMobileApplication.MUSIC.device_type,
             },
         )
@@ -1831,11 +1830,11 @@ class AmazonMusicMobileAPI:
 
     def retrieve_customer_home(self):
         resp = self.post(
-            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/stratus/",
+            url=f"https://music.amazon.{self.credentials.account_region.domain_tld}/{self.credentials.account_region.region.name}/api/stratus/",
             data={
                 "customerId": self.credentials.customer_id,  # it is not set, but it is required
-                "deviceId": self.credentials.device_info["device_serial_number"],
-                "deviceType": self.credentials.device_info["device_type"],
+                "deviceId": self.credentials.device_info.device_serial_number,
+                "deviceType": self.credentials.device_info.device_type,
                 "ipAddress": None,
                 "sessionId": None,
             },
@@ -1849,14 +1848,14 @@ class AmazonMusicMobileAPI:
     @functools.lru_cache()
     def get_account_status(self):
         response = self.post(
-            url=f"https://music.amazon.{self.credentials.tld}/{self.credentials.web_client_config.region}/api/stratus/",
+            url=f"https://music.amazon.com/{self.credentials.customer_info['home_region']}/api/stratus/",
             headers={
                 "x-amz-target": "com.amazon.stratus.StratusServiceExternal.isAccountValid",
                 "x-amzn-requestid": str(uuid.uuid4()),
             },
             data={
                 "customerId": self.credentials.customer_id,
-                "deviceId": self.credentials.device_info["device_serial_number"],
+                "deviceId": self.credentials.device_info.device_serial_number,
                 "deviceType": AmazonMobileApplication.MUSIC.device_type,
                 "ipAddress": None,
                 "verbose": True,
@@ -1879,45 +1878,6 @@ class AmazonMusicMobileAPI:
     def _deauthorize_device(self, device_serial: typing.Optional[str]):
         # remove device from authorized devices in amazon music
         return
-
-    def refresh_access_token(self, force: bool = False) -> None:
-        """
-        Refresh the access token
-
-        """
-        if force or self.credentials.access_token_expired:
-            if self.credentials.refresh_token is None:
-                message = "No refresh token found. Can't refresh access token."
-                LOGGER.critical(message)
-                raise Exception(message)
-
-            body = {
-                "app_name": "Amazon Music",
-                "app_version": self.application_version,
-                "source_token": self.credentials.refresh_token,
-                "requested_token_type": "access_token",
-                "source_token_type": "refresh_token",
-            }
-
-            resp = self.post(
-                f"https://api.amazon.{self.credentials.tld}/auth/token",
-                data=body,
-                sign=False,
-            )
-            resp_dict = resp.json()
-
-            expires = datetime.utcnow() + timedelta(
-                seconds=int(resp_dict["expires_in"])
-            )
-
-            self.credentials.access_token = resp_dict["access_token"]
-            self.credentials.expires = expires
-
-        else:
-            LOGGER.info(
-                "Access Token not expired. No refresh necessary. "
-                "To force refresh please use force=True"
-            )
 
     @staticmethod
     def _exteral_login(oauth_url: str, application: AmazonMobileApplication):
@@ -1951,7 +1911,7 @@ class AmazonMusicMobileAPI:
         login_inputs["email"] = email
         login_inputs["password"] = password
         metadata = cls._get_app_metadata(
-            user_agent=cls.USER_AGENT, oauth_url=oauth_url
+            # user_agent=cls.USER_AGENT, oauth_url=oauth_url
         )
         login_inputs["metadata1"] = encrypt_metadata(metadata)
         method, url = get_next_action_from_soup(oauth_soup, {"name": "signIn"})

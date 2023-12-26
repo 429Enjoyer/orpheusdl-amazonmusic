@@ -263,7 +263,7 @@ class ModuleInterface:
             final_creds = cached_creds
         else:
             final_creds = cached_creds | {
-                credentials.web_client_config.music_territory: 
+                credentials.account_region.country: 
                 credentials.to_dict()
             }
         return self._save_credentials_to_tsc(final_creds)
@@ -288,6 +288,8 @@ class ModuleInterface:
         cached_creds = self.tsc.read("credentials") or {}
         if not cached_creds:
             return
+        # for debug
+        # pprint.pprint(cached_creds)
 
         if selected_region and selected_region.country not in cached_creds and use_exact_region:
             return
@@ -327,6 +329,7 @@ class ModuleInterface:
                 
                 if self.settings["prefer_removal_of_device_when_revoked"] is True:
                     self.update_cached_credentials(credentials, remove_arg_credentials=True)
+                    self.print(f"{module_information.service_name}: Deleted from cache as per your settings.")
                     return
                 while True:
                     user_input = input(
@@ -335,12 +338,12 @@ class ModuleInterface:
                         f"{mobile_session.credentials.account_region.pretty_name!r}? (Y/N): "
                     )
                     if "Y" in user_input.upper():
-                        self.print(f"{module_information.service_name}: Deleting..")
+                        self.print(f"{module_information.service_name}: Deleting from cache..")
                         self.update_cached_credentials(credentials, remove_arg_credentials=True)
                         return
                     elif "N" in user_input.upper():
                         self.print(f"{module_information.service_name}: Skipped.")
-                        return None
+                        return
                     else:
                         self.print(f"{module_information.service_name}: Invalid input, please try again.")
                         continue
@@ -383,6 +386,8 @@ class ModuleInterface:
                     new_region,
                     use_exact_region=True
                 )
+                if not session:
+                    continue
                 self.print(
                     f"{module_information.service_name}: Using a {new_region.pretty_name!r} account "
                     f"for the region {selected_region.pretty_name!r} as you are not logged into said region."
@@ -1694,11 +1699,12 @@ class ModuleInterface:
             )
             # Make sure the entitlement PSSH exists
             and any(
-                name in available_entitlements
-                for name, _ in (
+                local_name in av_entitlement_name
+                for local_name, _ in (
                     item.split(":", maxsplit=1)
                     for item in self.settings["master_keys"]
                 )
+                for av_entitlement_name in available_entitlements
             )
         )
         has_katana_tier = (
@@ -1711,7 +1717,7 @@ class ModuleInterface:
         if not has_entitlements and subscription_tier is AmazonMusicTier.FREE:
             return {}
 
-        # print(f"{has_entitlements=}, {has_katana_tier=}")
+        # print(f"{has_entitlements=}, {has_katana_tier=}, {available_entitlements=}")
         if (
             has_entitlements or has_katana_tier
         ):
