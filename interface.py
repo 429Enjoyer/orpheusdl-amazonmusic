@@ -523,20 +523,20 @@ class ModuleInterface:
 
             track_to_use = self._get_usable_audio_track_of_mapped_quailty(
                 mapped_audio_tracks=mapped_audio_tracks,
-                quality_tier=QualityEnum(min(quality_tier.value, self.tier_parse[mobile_session.credentials.tier].value)) if self.options.disable_subscription_check or not self.settings["use_own_master_keys"] else quality_tier,
+                quality_tier=QualityEnum(min(quality_tier.value, self.tier_parse[mobile_session.credentials.tier].value)) if not self.options.disable_subscription_check and not self.settings["use_own_master_keys"] else quality_tier,
                 to_print=True,
             )
 
             track_data = (
                 data[track_id]
                 if data and track_id in data
-                else mobile_session.get_track_info(track_id, media_region=media_region) # music_territory="CA"
+                else mobile_session.get_track_info(track_id, region_to_use=media_region) # music_territory="CA"
             )
             album_id = str(track_data["album"]["asin"])
             album_data = (
                 data[album_id]
                 if data and album_id in data
-                else mobile_session.get_album_info(album_id, media_region=media_region) # music_territory="NZ"
+                else mobile_session.get_album_info(album_id, region_to_use=media_region) # music_territory="NZ"
             )
             album_id = str(album_data["asin"])
             
@@ -748,6 +748,7 @@ class ModuleInterface:
 
     def get_track_download(self, audio_track: AudioTrack, media_region: AmazonRegion, **kwargs):
         mobile_session, _ = self.select_session(media_region)
+        # print(audio_track)
         session_id = None
         try:
             os.makedirs("temp/", exist_ok=True)
@@ -806,13 +807,13 @@ class ModuleInterface:
             if not os.path.exists(decrypted_track_location):
                 session_id = self.cdm.open()
                 
-                used_entitlement: dict[str, PSSH] | None = None
+                used_entitlement: dict[str, PSSH] | None = {}
                 for name, pssh_to_test in audio_track.entitlements.to_dict().items():
                     if not self.cdm.system_id == 9780:
                         continue
                     if not pssh_to_test:
                         continue
-                    if f"{name.upper()}_CONTENT" not in mobile_session.credentials.tier.internal_content_tiers:
+                    if f"{name.upper()}_CONTENT" not in mobile_session.credentials.tier.internal_content_tiers and not self.options.disable_subscription_check:
                         continue
                     if audio_track.entitlements.music_territory != mobile_session.credentials.account_region.country:
                         continue
@@ -829,17 +830,18 @@ class ModuleInterface:
                         license_response = mobile_session.get_license_response(
                             asin=audio_track.asin, challenge=license_challenge, drm_type="WIDEVINE_ENTITLEMENT"
                         )
-                    except (ValueError, httpx.HTTPStatusError):
+                    except (ValueError, httpx.HTTPStatusError) as e:
                         self.print(f"{module_information.service_name}: Failed entitlement master key acquisition.")
                         continue
                     else:
                         if not license_response:
                             # license_response = input("License retrieval failed, enter response here (for testing): ")
                             continue
-                        used_entitlement = {
+                        used_entitlement.update({
                             name: pssh_to_test
-                        }
-                        break
+                        })
+                        self.cdm.parse_license(session_id, license_response)
+                        continue
                 else:
                     license_challenge = base64.b64encode(
                         self.cdm.get_license_challenge(
@@ -854,40 +856,42 @@ class ModuleInterface:
                         raise ValueError("Failed to communicate with the license server")
 
 
-                self.cdm.parse_license(session_id, license_response)
-                
+                # self.cdm.parse_license(session_id, license_response)
+                # print(used_entitlement)
                 for key in self.cdm.get_keys(session_id):
                     if key.type == "ENTITLEMENT":
                         if not used_entitlement:
                             continue
 
                         name, used_pssh = used_entitlement.popitem()
+                        # name , used_pssh = used_entitlement[next(iter(used_entitlement))]
                         key_id, dec_key = self.get_decrypted_key(
                             key.key,
                             used_pssh,
                             "CONTENT"
                         )
                         key_name = f"{name.upper()}:{audio_track.entitlements.music_territory}"
-                        if not self.settings["master_keys"].get("key_name"):
-                            self.print(
-                                f'{module_information.service_name}: New entitlement key '
-                                f'found for {audio_track.entitlements.music_territory}! '
-                                f'"{key_name}": "{key.key.hex()}"'
-                            )
+                        # if not self.settings["master_keys"].get("key_name"):
+                        self.print(
+                            f'{module_information.service_name}: New entitlement key '
+                            f'found for {audio_track.entitlements.music_territory}! '
+                            f'"{key_name}": "{key.key.hex()}"'
+                        )
 
                     elif key.type == "CONTENT":
                         key_id = key.kid.hex
                         dec_key = key.key.hex()
                     else:
                         continue
+                    continue
                         
-                    self.call_shaka_packager(
-                        encrypted_file=encrypted_track_location,
-                        destination_file=decrypted_track_location,
-                        key_id=key_id,
-                        key=dec_key,
-                        label=audio_track.quality.upper()
-                    )
+                    # self.call_shaka_packager(
+                    #     encrypted_file=encrypted_track_location,
+                    #     destination_file=decrypted_track_location,
+                    #     key_id=key_id,
+                    #     key=dec_key,
+                    #     label=audio_track.quality.upper()
+                    # )
 
             if not os.path.exists(decrypted_track_location):
                 raise FileNotFoundError("Unable to decrypt the downloaded media file")
@@ -1709,7 +1713,10 @@ class ModuleInterface:
         )
         has_katana_tier = (
             not self.settings["use_own_master_keys"]
-            and subscription_tier is AmazonMusicTier.UNLIMITED
+            and (
+                self.options.disable_subscription_check
+                or subscription_tier is AmazonMusicTier.UNLIMITED
+            )
             # Needed as license acquitsion, might be blocked due to cross region calling
             and account_region.region == media_region.region
         )

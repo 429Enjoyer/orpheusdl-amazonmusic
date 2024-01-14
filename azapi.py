@@ -961,8 +961,8 @@ class AmazonMusicMobileAPI:
                 },
                 "musicDashVersionList": [
                     # dash_version,
-                    # "SIREN", # only HAWKFIRE, incompatible with SIREN_KATANA parsing.
-                    "SIREN_KATANA",  # with 360 audio, but keeps on getting invalid key size (with group_pssh)? PSSH Entitled key size is always 32 bytes, not sure why (brings error if used)
+                    # "SIREN", # only HAWKFIRE, incompatible with SIREN_KATANA parsing. like V2 parsing.
+                    "SIREN_KATANA",  # with 360 audio
                     # "SIREN_KATANA_NO_CLEAR_LEAD", #this and no entitlement, is what is used by Amazon Music Web
                     # "V2", # for obtaining legacy AAC audio
                     # "V1", # not working
