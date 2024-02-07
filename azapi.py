@@ -1191,9 +1191,13 @@ class AmazonMusicMobileAPI:
                         continue
 
                     names = credits_mapping.get(credit_name, [])
-
+                    names.extend(people_names)
                     # Remove duplicate names
-                    names = list(set(names + people_names))
+                    names = sorted(
+                        set(names),
+                        key=names.index
+                    )
+
                     credits_mapping.update({credit_name: names})
 
         return credits_mapping

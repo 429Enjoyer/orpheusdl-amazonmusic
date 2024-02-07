@@ -615,7 +615,7 @@ class ModuleInterface:
             # Calculate the total disc avaliable by iterating each track and using the highest value
             disc_total = max(int(t["discNum"]) for t in album_data.get("tracks", [{}]))
             # Sanitize writers
-            writers = [str(item).strip() for item in track_data.get("songWriters", [])]
+            writers = [str(item).strip() for item in track_data.get("songWriters", []) if item]
 
             for name in writers.copy():
                 if names := self.parse_credit_names_from_name(name):
@@ -657,13 +657,19 @@ class ModuleInterface:
             # this genre tends to be more specific however,
             # it may not be always avaliable
             # e.g https://music.amazon.co.jp/albums/B09JNRPVHN?trackAsin=B09JNRQQ3P
-            genres = list(
-                self.parse_genres_from_genre(search_data.get("primaryGenre", ""))
-                | self.parse_genres_from_genre(
-                    album_data["productDetails"]["primaryGenreName"]
-                )
+            genres = sorted(
+                list(
+                    item
+                    for item in set(
+                        self.parse_genres_from_genre(search_data.get("primaryGenre", ""))
+                        | self.parse_genres_from_genre(
+                            album_data["productDetails"]["primaryGenreName"]
+                        )
+                    )
+                    if item
+                ),
+                key=len
             )
-
             tags = Tags(
                 album_artist=album_data["primaryArtistName"],
                 composer=composers,
@@ -794,6 +800,7 @@ class ModuleInterface:
                         pssh=selected_pssh,
                         enc_key_type="CONTENT",
                     )
+                    # print(f"using own entitlements {key_id=} {key=}")
                     self.call_shaka_packager(
                         encrypted_file=encrypted_track_location,
                         destination_file=decrypted_track_location,
@@ -806,6 +813,7 @@ class ModuleInterface:
             # Interact with the license server
             if not os.path.exists(decrypted_track_location):
                 session_id = self.cdm.open()
+                # print(f"{audio_track.entitlements=} {audio_track.web_pssh=}")
                 
                 used_entitlement: dict[str, PSSH] | None = {}
                 for name, pssh_to_test in audio_track.entitlements.to_dict().items():
@@ -855,8 +863,8 @@ class ModuleInterface:
                     if not license_response:
                         raise ValueError("Failed to communicate with the license server")
 
+                    self.cdm.parse_license(session_id, license_response)
 
-                # self.cdm.parse_license(session_id, license_response)
                 # print(used_entitlement)
                 for key in self.cdm.get_keys(session_id):
                     if key.type == "ENTITLEMENT":
@@ -883,15 +891,15 @@ class ModuleInterface:
                         dec_key = key.key.hex()
                     else:
                         continue
-                    continue
+                    # continue
                         
-                    # self.call_shaka_packager(
-                    #     encrypted_file=encrypted_track_location,
-                    #     destination_file=decrypted_track_location,
-                    #     key_id=key_id,
-                    #     key=dec_key,
-                    #     label=audio_track.quality.upper()
-                    # )
+                    self.call_shaka_packager(
+                        encrypted_file=encrypted_track_location,
+                        destination_file=decrypted_track_location,
+                        key_id=key_id,
+                        key=dec_key,
+                        label=audio_track.quality.upper()
+                    )
 
             if not os.path.exists(decrypted_track_location):
                 raise FileNotFoundError("Unable to decrypt the downloaded media file")
