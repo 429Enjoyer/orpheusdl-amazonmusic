@@ -63,21 +63,17 @@ class PSSHEntitlements:
         return dataclasses.asdict(self)
     
     def iterate(self):
-        return (
-            (name, item)
-            for name, item in (
-                (entitle_name, getattr(self, entitle_name))
-                for entitle_name in self.__dataclass_fields__
-            )
-            if item is not None
-            and isinstance(item, PSSH)
-        )
+        for name, item in (
+            (field.name, getattr(self, field.name))
+            for field in dataclasses.fields(self)
+        ):
+            if not isinstance(item, PSSH):
+                continue
+            yield (name, item)
     
     def _get_entitlements_group_id(self):
         # me when the method i want to use is literally a pain to implement:
-        for _, entitlement in self.iterate():
-            if entitlement is None:
-                continue
+        for n, entitlement in self.iterate():
             if not isinstance(entitlement, PSSH):
                 continue
             pssh = WidevinePsshData()
@@ -238,7 +234,7 @@ class ModuleInterface:
         )
         if not isinstance(mobile_session, AmazonMusicMobileAPI):
             # die
-            raise Exception("Login failed")
+            raise TypeError("Login failed")
 
         LOGGER.debug(mobile_session.retrieve_capability())
         self.update_cached_credentials(mobile_session.credentials)
@@ -395,7 +391,7 @@ class ModuleInterface:
                 
                 selected_region = new_region
                 break
-        if not session:
+        if not isinstance(session, AmazonMusicMobileAPI):
             raise ValueError("No accounts logged in!")
         
         entitlement_usage = (
@@ -588,29 +584,38 @@ class ModuleInterface:
                 # Fallback, include the formatted artist name (might include contributors)
                 artists.append(track_data["artist"]["name"])
 
+            # Assumes the primaryArtistName is one single individual name, not concanated
+            primary_artist_name = album_data.get("primaryArtistName", "")
             # Attempt to seperate each contributor if they're concatenated
             for artist in artists.copy():
                 if sep_artists := self.parse_credit_names_from_name(artist):
                     if artist in artists:
                         artists.remove(artist)
-                    artists.extend(sep_artists)
+                    for new_art in sep_artists:
+                        if not primary_artist_name:
+                            continue
+                        if (
+                            (
+                                new_art in primary_artist_name
+                                or
+                                primary_artist_name in new_art
+                            ) and
+                            new_art != primary_artist_name
+                        ):
+                            # Fails here when an artist thats split
+                            # isn't supposed to be split
+                            continue
+                        artists.append(new_art)
 
-            primary_artist_names = self.parse_credit_names_from_name(
-                album_data["primaryArtistName"]
-            )
-
-            if album_data["primaryArtistName"] in artists:
-                artists.remove(album_data["primaryArtistName"])
-            if primary_artist_names[0] in artists:
-                artists.remove(primary_artist_names[0])
-
-            artists.extend(primary_artist_names[1:])
+            if primary_artist_name in artists:
+                artists.remove(primary_artist_name)
 
             # Remove duplicates
             artists = natsort.natsorted(set(artists))
 
             # Prefer to have the primary artist name at the start
-            artists.insert(0, primary_artist_names[0])
+            artists.insert(0, primary_artist_name)
+            print(f'{artists=}')
 
             # Calculate the total disc avaliable by iterating each track and using the highest value
             disc_total = max(int(t["discNum"]) for t in album_data.get("tracks", [{}]))
@@ -671,7 +676,7 @@ class ModuleInterface:
                 key=len
             )
             tags = Tags(
-                album_artist=album_data["primaryArtistName"],
+                album_artist=primary_artist_name,
                 composer=composers,
                 copyright=album_data["productDetails"]["copyright"],
                 isrc=track_data.get("isrc"),
@@ -1057,9 +1062,7 @@ class ModuleInterface:
 
         return AlbumInfo(
             name=self.sanitize_parental_status_name(album_data.get("title", "Unknown")),
-            artist=self.parse_credit_names_from_name(
-                album_data.get("primaryArtistName", "")
-            )[0],
+            artist=album_data.get("primaryArtistName", ""),
             tracks=[track["asin"] for track in album_data.get("tracks", [])],
             release_year=int(self._get_date_from_metadata(album_data).strftime("%Y")),
             explicit=explicit,
@@ -1455,9 +1458,8 @@ class ModuleInterface:
 
     @staticmethod
     def parse_credit_names_from_name(name: str):
-        # Removed ", " due to accidental splitting for artists like "Tyler, The Creator"
         return list(
-            {str(item) for item in re.split(r" & | - | / | feat. ", name) if item}
+            {str(item) for item in re.split(r" & |, | - | / | feat. ", name) if item}
         )
 
     @staticmethod
