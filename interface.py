@@ -615,7 +615,6 @@ class ModuleInterface:
 
             # Prefer to have the primary artist name at the start
             artists.insert(0, primary_artist_name)
-            print(f'{artists=}')
 
             # Calculate the total disc avaliable by iterating each track and using the highest value
             disc_total = max(int(t["discNum"]) for t in album_data.get("tracks", [{}]))
@@ -1984,6 +1983,9 @@ class ModuleInterface:
             }
 
             quality_to_track_mapping.update({quality_enum: grouped_tracks})
+
+        # import pprint
+        # pprint.pprint(quality_to_track_mapping)
 
         return quality_to_track_mapping
 
