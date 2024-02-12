@@ -26,7 +26,9 @@ import aria2p
 import ffmpeg
 import natsort
 import pywidevine
-from pywidevine import PSSH, Cdm, Device, WidevinePsshData, Key
+from pywidevine import PSSH, Cdm, Device, Key
+from pywidevine.utils import get_binary_path
+from pywidevine.license_protocol_pb2 import WidevinePsshData
 from Crypto.Cipher import AES
 
 from tqdm import tqdm
@@ -440,6 +442,7 @@ class ModuleInterface:
 
         # use the same logic as orpheusdl cuz lazy
         url_constants = {
+            "tracks": DownloadTypeEnum.track,
             "albums": DownloadTypeEnum.album,
             "playlists": DownloadTypeEnum.playlist,
             "user-playlists": DownloadTypeEnum.playlist,
@@ -632,7 +635,6 @@ class ModuleInterface:
             composers = "; ".join(composers)
 
             url = f"https://music.amazon.{media_region.domain_tld}/albums/{album_id}?trackAsin={track_id}&musicTerritory={media_region.country}"
-
             extra_tags = {
                 "Composer": composers,  # force set the composer tag, because orpheus doesn't handle it
                 "WWW": url,
@@ -827,9 +829,9 @@ class ModuleInterface:
                         continue
                     if f"{name.upper()}_CONTENT" not in mobile_session.credentials.tier.internal_content_tiers and not self.options.disable_subscription_check:
                         continue
-                    if audio_track.entitlements.music_territory != mobile_session.credentials.account_region.country:
-                        continue
-                    # if name != "hawkfire":
+                    
+                    # maybe?
+                    # if audio_track.entitlements.music_territory != mobile_session.credentials.account_region.country:
                     #     continue
 
                     license_challenge = base64.b64encode(
@@ -838,6 +840,7 @@ class ModuleInterface:
                         )
                     ).decode("utf-8")
 
+                    license_response = None
                     try:
                         license_response = mobile_session.get_license_response(
                             asin=audio_track.asin, challenge=license_challenge, drm_type="WIDEVINE_ENTITLEMENT"
@@ -849,12 +852,14 @@ class ModuleInterface:
                         if not license_response:
                             # license_response = input("License retrieval failed, enter response here (for testing): ")
                             continue
+                        # print(f"used entitle acq: {name}")
                         used_entitlement.update({
                             name: pssh_to_test
                         })
                         self.cdm.parse_license(session_id, license_response)
-                        continue
+                        break
                 else:
+                    # print("reg")
                     license_challenge = base64.b64encode(
                         self.cdm.get_license_challenge(
                             session_id, audio_track.web_pssh, privacy_mode=False
@@ -895,6 +900,7 @@ class ModuleInterface:
                         dec_key = key.key.hex()
                     else:
                         continue
+                    # print(f"{key_id=} {dec_key=}")
                     # continue
                         
                     self.call_shaka_packager(
@@ -927,7 +933,7 @@ class ModuleInterface:
             final_decrypted_track_location = (
                 f"{create_temp_filename()}.{selected_codec_data.container.name}"
             )
-
+            # return
             ffcmd: ffmpeg = ffmpeg.input(decrypted_track_location)  # type: ignore
             ffcmd_out_kwargs = {
                 "filename": final_decrypted_track_location,
@@ -940,9 +946,11 @@ class ModuleInterface:
                 )
 
             ffcmd = ffcmd.output(**ffcmd_out_kwargs)
-            ffcmd.run()
-
+            stdout, stderr = ffcmd.run()
+            if stderr:
+                raise RuntimeError(f"ffmpeg: {stderr}")
             silentremove(decrypted_track_location)
+
 
         finally:
             if session_id:
@@ -1206,7 +1214,7 @@ class ModuleInterface:
         self, track_id: str, media_region: AmazonRegion, data={}, **kwargs
     ):  # Mandatory if ModuleModes.credits
         mobile_session, _ = self.select_session(media_region)
-        track_credits = mobile_session.get_track_xray(track_id, parse_credits=True)
+        track_credits = mobile_session.get_track_xray(track_id, region_to_use=media_region, parse_credits=True)
         return [
             CreditsInfo(
                 sanitise_name(k),
@@ -1992,7 +2000,7 @@ class ModuleInterface:
     @staticmethod
     def call_shaka_packager(encrypted_file: str, destination_file: str, key_id: str, key: str, label: str):
         platform = {"win32": "win", "darwin": "osx"}.get(sys.platform, sys.platform)
-        executable = pywidevine.get_binary_path(f"packager-{platform}", f"packager-{platform}-x64", "shaka-packager", "packager")
+        executable = get_binary_path(f"packager-{platform}", f"packager-{platform}-x64", "shaka-packager", "packager")
         if not executable:
             raise EnvironmentError("Shaka Packager executable not found but is required")
 

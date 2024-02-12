@@ -416,7 +416,7 @@ class AmazonMusicMobileAPI:
         )
         if response.status_code != 200:
             raise Exception(
-                f"Failed to get track metadata: {response.status_code} {response.text}"
+                f"Failed to get metadata: {response.status_code} {response.text}"
             )
         resp_json = response.json()
 
@@ -1046,8 +1046,8 @@ class AmazonMusicMobileAPI:
             raise ValueError(
                 f"Failed to get license: {response.status_code} {response.text}"
             )
-
-        return response.json()["license"]
+        resp = response.json()
+        return resp["license"]
 
     # Shortcuts
 
@@ -1062,23 +1062,23 @@ class AmazonMusicMobileAPI:
     def get_track_info(self, track_asin: str, *args, **kwargs):
         resp = self.get_metadata(track_asin, *args, **kwargs)["trackList"]
         if len(resp) > 1 or not resp:
-            raise ValueError(f"Failed to get track metadata. {resp}")
+            raise ValueError(f"Track metadata is {'not available' if not resp else 'invalid'}: {resp}")
         return resp[0]
 
     def get_album_info(self, album_asin: str, *args, **kwargs):
         resp = self.get_metadata(album_asin, *args, **kwargs)["albumList"]
         if len(resp) > 1 or not resp:
-            raise ValueError(f"Failed to get album metadata. {resp}")
+            raise ValueError(f"Album metadata is {'not available' if not resp else 'invalid'}: {resp}")
 
         return resp[0]
 
     def get_artist_info(self, artist_asin: str, *args, **kwargs):
         resp = self.get_metadata(artist_asin, *args, **kwargs)["artistList"]
         if len(resp) > 1 or not resp:
-            raise ValueError(f"Failed to get artist metadata. {resp}")
+            raise ValueError(f"Artist metadata is {'not available' if not resp else 'invalid'}: {resp}")
         return resp[0]
 
-    def get_track_xray(self, asin: str, parse_credits: typing.Optional[bool] = False):
+    def get_track_xray(self, asin: str, region_to_use: AmazonRegion, parse_credits: typing.Optional[bool] = False):
         response = self.post(
             url=f"https://{str(self.credentials.account_region.region.name).lower()}.mobilemesk.skill.music.a2z.com/api/showXray/{asin}",
             add_default_stratus_headers=False,
@@ -1087,7 +1087,7 @@ class AmazonMusicMobileAPI:
                 "x-amzn-device-family": "MobileAndroid",
                 "x-amzn-device-manufacturer": "Google",
                 "x-amzn-device-model": "Pixel 5",
-                "x-amzn-device-language": "en_US",
+                "x-amzn-device-language": region_to_use.locale,
                 "x-amzn-device-height": "2560",
                 "x-amzn-device-width": "1440",
                 "x-amzn-device-scale": "3.5",
