@@ -4,9 +4,9 @@ beautifulsoup4==4.12.2
 ffmpeg_python==0.2.0
 httpx==0.23.3
 natsort==8.4.0
-pycryptodome==3.18.0
-protobuf==4.21.6
-pywidevine==1.6.0
+pycryptodome==3.19.0
+protobuf==4.25.1
+pywidevine==1.8.0
 rsa==4.9
 tqdm==4.66.1
 xmltodict==0.13.0
