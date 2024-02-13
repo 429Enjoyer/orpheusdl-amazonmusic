@@ -1,10 +1,9 @@
 import base64
+from collections import OrderedDict
 import functools
 import logging
-from pathlib import Path
 import os
 import itertools
-import pprint
 import random
 import re
 import shutil
@@ -12,21 +11,17 @@ import socket
 import subprocess
 import sys
 import typing
-import json
 import dataclasses
 import itertools
 import httpx
 from datetime import datetime, timedelta
 import concurrent.futures
 from urllib.parse import urlparse, parse_qs
-from uuid import UUID, uuid1, uuid4
-from pymp4.parser import Box
 
 import aria2p
 import ffmpeg
 import natsort
-import pywidevine
-from pywidevine import PSSH, Cdm, Device, Key
+from pywidevine import PSSH, Cdm, Device
 from pywidevine.utils import get_binary_path
 from pywidevine.license_protocol_pb2 import WidevinePsshData
 from Crypto.Cipher import AES
@@ -38,7 +33,6 @@ from utils.models import *
 from utils.utils import (
     create_temp_filename,
     download_file,
-    download_to_temp,
     silentremove,
     sanitise_name,
 )
@@ -1654,16 +1648,22 @@ class ModuleInterface:
                 tracks,
             ) in mapped_qual_tracks:
                 # self.print(f"{quality_enum=}, {quality_name=}, {tracks=}")
+                # pprint.pprint(mapped_qual_tracks)
                 if not tracks:
                     continue
 
                 if len(tracks) > 1 and to_print:
-                    LOGGER.warning(
-                        f"There are more than one tracks avaliable for {quality_name}. "
-                        f"Avaliable qualities: "
-                        ", ".join(
-                            f"{item.quality} with ranking {item.quality_ranking}"
-                            for item in tracks
+                    self.print(
+                        (
+                            f"{module_information.service_name}: "
+                            f"There are more than one tracks avaliable for {quality_name}. "
+                            f"\nAvaliable qualities: "
+                        ) + 
+                        (
+                            "".join(
+                                f"{module_information.service_name}: {item.quality} with ranking {tracks.index(item) + 1}, "
+                                for item in tracks
+                            )
                         )
                     )
 
@@ -1922,11 +1922,16 @@ class ModuleInterface:
 
     @staticmethod
     def _iter_over_tracks_to_quality_map(
-        mapping: dict[QualityEnum, dict[str, list[AudioTrack]]]
+        mapping: dict[QualityEnum, OrderedDict[str, list[AudioTrack]]]
     ):
-        for quality_enum, quality_items in mapping.items():
-            for quality_name, tracks in quality_items.items():
+        for quality_enum in reversed(QualityEnum):
+            quality_tracks = mapping.get(quality_enum)
+            if not quality_tracks:
+                continue
+            for quality_name, tracks in quality_tracks.items():
+                # print(f"{quality_enum=}, {quality_name=}, {tracks=}")
                 yield quality_enum, quality_name, tracks
+
         return
 
     def tracks_to_quality_map(
@@ -1954,12 +1959,8 @@ class ModuleInterface:
         quality_to_track_mapping = {}
 
         for quality_enum, qualities in reversed(self.quality_parse.items()):
-
             def key_for_sorting_avaliable_tracks(track: AudioTrack):
-                if any(item in track.quality for item in ("ATMOS", "LD", "RA360")):
-                    return track.bitrate
-                if quality_enum.value <= QualityEnum.LOSSLESS.value:
-                    return track.quality_ranking
+                return track.bitrate
 
             def key_for_filtering_audiotracks(track: AudioTrack):
                 if allow_web_pssh and not track.web_pssh:
@@ -1976,19 +1977,19 @@ class ModuleInterface:
                 return
 
             def key_for_grouping_audiotracks(track: AudioTrack):
-                return track.quality
+                return track.official_quality_name
 
             # AudioTracks are sorted best quality to worse
             
-            grouped_tracks = {
-                key: natsort.natsorted(
+            grouped_tracks = OrderedDict([
+                (key, natsort.natsorted(
                     group, key=key_for_sorting_avaliable_tracks, reverse=True
-                )
+                ))
                 for key, group in itertools.groupby(
                     [item for item in tracks if key_for_filtering_audiotracks(item)],
                     key=key_for_grouping_audiotracks,
                 )
-            }
+            ])
 
             quality_to_track_mapping.update({quality_enum: grouped_tracks})
 
