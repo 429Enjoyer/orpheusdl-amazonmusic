@@ -935,8 +935,9 @@ class ModuleInterface:
                 "audio_bitrate": f"{audio_track.bitrate}k",
             }
             if self.settings["trim_track_by_sample_rate"]:
+                # self.print(f"Trimming out the first {int(int(audio_track.sample_rate) * 6.5)} samples")
                 ffcmd_out_kwargs.update(
-                    {"af": f"atrim=start_sample={audio_track.sample_rate * 6.5}"}
+                    {"af": f"atrim=start_sample={int(int(audio_track.sample_rate) * 6.5)}"}
                 )
 
             ffcmd = ffcmd.output(**ffcmd_out_kwargs)
