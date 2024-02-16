@@ -811,7 +811,7 @@ class ModuleInterface:
                     break
                     
             # Interact with the license server
-            if not os.path.exists(decrypted_track_location):
+            if not os.path.exists(decrypted_track_location) and mobile_session.credentials.tier is not AmazonMusicTier.FREE:
                 session_id = self.cdm.open()
                 # print(f"{audio_track.entitlements=} {audio_track.web_pssh=}")
                 
@@ -1738,9 +1738,6 @@ class ModuleInterface:
             # Needed as license acquitsion, might be blocked due to cross region calling
             and account_region.region == media_region.region
         )
-        
-        if not has_entitlements and subscription_tier is AmazonMusicTier.FREE:
-            return {}
 
         # print(f"{has_entitlements=}, {has_katana_tier=}, {available_entitlements=}")
         if (
