@@ -143,6 +143,7 @@ class AmazonMusicMobileAPI:
         serial: typing.Optional[str] = None,
         load_credentials: typing.Optional[bool] = True,
         application: typing.Optional[AmazonMobileApplication] = None,
+        oauth_flow_callback: typing.Optional[typing.Callable[[str, str], str]] = None,
     ):
         if len(country_code) != 2:
             raise ValueError(
@@ -181,7 +182,9 @@ class AmazonMusicMobileAPI:
         )
 
         # authorization_code = cls._internal_login(session, oauth_url, email, password)
-        authorization_code = cls._exteral_login(oauth_url, application)
+        authorization_code = cls._exteral_login(
+            oauth_url, application, oauth_flow_callback=oauth_flow_callback
+        )
 
         items = {
             "authorization_code": authorization_code,
@@ -357,11 +360,10 @@ class AmazonMusicMobileAPI:
         Artist ASIN -> `response.json()['artistList'][0]`
 
         ## List of avaliable features:
-        [fullAlbumDetails, playlistLibraryAvailability, disableSubstitution, childParentOwnership, trackLibraryAvailability,
-        hasLyrics, ownership, expandTracklist, includeVideo, requestAudioVideo, popularity, albumArtist, collectionLibraryAvailability,
-        includePurchaseDetails, editorialAssociations]
+        fullAlbumDetails, playlistLibraryAvailability, disableSubstitution, childParentOwnership, migratedLikeAvailability, trackLibraryAvailability,
+        hasLyrics, ownership, expandTracklist, includeVideo, requestAudioVideo, popularity, albumArtist, collectionLibraryAvailability, includePurchaseDetails
         """
-        # Valid keywords to Amazon JP (for playlist metadata, diff endpoint)
+        # Valid keywords to Amazon JP (for playlist metadata, diff endpoint) 
         # objectId,fileName,fileExtension,fileSize,creationDate,lastUpdatedDate,orderId,asin,purchaseDate,localFilePath,md5,status,purchased,uploaded,title,sortTitle,rating,marketplace,physicalOrderId,assetType,artistName,artistAsin,contributors,trackNum,discNum,primaryGenre,duration,bitrate,composer,songWriter,performer,lyricist,publisher,errorCode,instantImport,primeStatus,isMusicSubscription,albumName,albumAsin,albumArtistName,albumArtistAsin,albumContributors,albumRating,albumPrimaryGenre,albumReleaseDate,sortArtistName,sortAlbumName,sortAlbumArtistName,audioUpgradeDate,parentalControls,assetEligibility,eligibility,internalTags
         if not asins:
             raise ValueError(asins)
@@ -394,9 +396,9 @@ class AmazonMusicMobileAPI:
                     "expandTracklist",
                     "fullAlbumDetails",
                     "includePurchaseDetails",
-                    "editorialAssociations",
                     "trackLibraryAvailability",
                     "collectionLibraryAvailability",
+                    "migratedLikeAvailability",
                     "playlistLibraryAvailability",
                 ],
                 "filters": None,
@@ -539,7 +541,6 @@ class AmazonMusicMobileAPI:
         """
         return self._search(*args, **kwargs)
 
-    @functools.lru_cache()
     def _search(
         self,
         query: str,
@@ -623,7 +624,7 @@ class AmazonMusicMobileAPI:
             return {}
 
         if not asins:
-            return self.get_documents_from_search_results(results)
+            return tuple(self.get_documents_from_search_results(results))
 
         for asin in asins:
             if result := self.find_item_by_asin_in_search_results(results, asin):
@@ -1884,23 +1885,43 @@ class AmazonMusicMobileAPI:
         return
 
     @staticmethod
-    def _exteral_login(oauth_url: str, application: AmazonMobileApplication):
-        print(
-            "Please copy the following url and insert it in a web browser of "
-            "your choice:"
-            f"\n{oauth_url}\n"
-            "Now you have to login with your Amazon credentials. After submit "
-            "your username and password you have to do this a second time "
-            "and solving a captcha before sending the login form.\n"
-            "After login, your browser will show you a error page (not found). "
-            "Do not worry about this. It has to be like this. Please copy the url from the address bar in your browser now.\n"
-            f"\nNOTE: You are currently logging into {application.official_name!r}, as it is required."
-        )
+    def _exteral_login(
+        oauth_url: str,
+        application: AmazonMobileApplication,
+        oauth_flow_callback: typing.Optional[typing.Callable[[str, str], str]] = None,
+    ):
+        if oauth_flow_callback:
+            callback_url = oauth_flow_callback(oauth_url, application.official_name)
+        else:
+            print(
+                "\n"
+                "=== Amazon Music login (browser) ===\n"
+                "\n"
+                "1. Open this URL in your browser (Ctrl+click if your terminal supports it):\n"
+                f"\n{oauth_url}\n"
+                "\n"
+                "2. Sign in with your Amazon account.\n"
+                "   You may need to enter your password twice and complete a CAPTCHA.\n"
+                "\n"
+                "3. After login, the browser will show a \"not found\" / error page — that is normal.\n"
+                "\n"
+                "4. Copy the full URL from the address bar and paste it below.\n"
+                f"\n"
+                f"   (Logging into {application.official_name} as required by the module.)\n"
+            )
+            callback_url = input("\nPaste the URL from your browser after login:\n").strip()
 
-        callback_url = input("Please insert the copied url (after login):\n")
+        if not callback_url or not str(callback_url).strip():
+            raise ValueError("Amazon Music login cancelled: no callback URL provided.")
 
-        response_url = httpx.URL(callback_url)
+        response_url = httpx.URL(str(callback_url).strip())
         parsed_url = parse_qs(response_url.query.decode())
+
+        if "openid.oa2.authorization_code" not in parsed_url:
+            raise ValueError(
+                "Amazon Music login failed: pasted URL does not contain an authorization code.\n"
+                "Copy the full address bar URL from the page shown right after login (maplanding)."
+            )
 
         authorization_code = parsed_url["openid.oa2.authorization_code"][0]
         return authorization_code

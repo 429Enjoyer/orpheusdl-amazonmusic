@@ -121,6 +121,7 @@ class AmazonRegion:
                 ("UY", "ATVPDKIKX0DER", "Uruguay", "es_UY", "com"),
             ],
             "EU": [
+                ("NL", "A1805IZSGTT6HS", "Netherlands", "nl_NL", "com"),
                 ("IN", "A21TJRUUN4KGV", "India", "hi_IN", "in"), # special in terms of the marketplace id
                 ("GB", "A1F83G8C2ARO7P", "United Kingdom", "en_GB", "co.uk"),
                 ("ES", "A1RKKUPIHCS9HS", "Spain", "es_ES", "es"),
@@ -144,7 +145,6 @@ class AmazonRegion:
                 ("LT", "ATVPDKIKX0DER", "Lithuania", "lt_LT", "com"),
                 ("LU", "ATVPDKIKX0DER", "Luxembourg", "fr_LU", "com"),
                 ("MT", "ATVPDKIKX0DER", "Malta", "mt_MT", "com"),
-                ("NL", "A1805IZSGTT6HS", "Netherlands", "nl_NL", "com"),
                 ("PL", "A1C3SOZRARQ6R3", "Poland", "pl_PL", "com"),
                 ("PT", "ATVPDKIKX0DER", "Portugal", "pt_PT", "com"),
                 ("SK", "ATVPDKIKX0DER", "Slovakia", "sk_SK", "com"),

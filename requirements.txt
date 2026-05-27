@@ -1,4 +1,6 @@
-aria2p==0.11.3
+# Canonical install: pip install -r requirements.txt (repo root) + requirements-gui.txt
+# Do not pip install this file alone. Listed here for reference / upstream parity.
+
 audible==0.8.2
 beautifulsoup4==4.12.2
 ffmpeg_python==0.2.0
@@ -12,4 +14,4 @@ tqdm==4.66.1
 xmltodict==0.13.0
 python-dateutil
 brotli
-bs4
+# bs4: use beautifulsoup4 above (provides `from bs4 import BeautifulSoup`)
