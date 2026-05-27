@@ -16,6 +16,7 @@ import itertools
 import httpx
 from datetime import datetime, timedelta
 import concurrent.futures
+import threading
 from urllib.parse import urlparse, parse_qs
 
 import ffmpeg
@@ -46,6 +47,9 @@ LOGGER = logging.getLogger(__name__)
 
 # Album/playlist search: probe a few tracks per row (not every track) for acceptable speed.
 SEARCH_QUALITY_MAX_TRACK_PROBE = 3
+# Search rows always probe up to these tiers (independent of the user's download quality).
+SEARCH_PROBE_STEREO_TIER = QualityEnum.HIFI
+SEARCH_PROBE_SPATIAL_TIER = QualityEnum.ATMOS
 
 SHAKA_PACKAGER_HELP_URL = "https://github.com/shaka-project/shaka-packager/releases/latest"
 
@@ -243,6 +247,8 @@ class ModuleInterface:
         self.module_controller = module_controller
         self.print = module_controller.printer_controller.oprint
         self.tsc = module_controller.temporary_settings_controller
+        self._quality_notice_seen: set[str] = set()
+        self._quality_notice_lock = threading.Lock()
 
         # Items highest are iterated first
         self.quality_parse = {
@@ -262,13 +268,12 @@ class ModuleInterface:
                 "HD",
             ],
             QualityEnum.HIFI: ["UHD"],
-        }
-        if not self.settings.get("force_non_spatial", False):
-            self.quality_parse[QualityEnum.HIFI] = [
-                "UHD",
+            # Spatial tiers are only used when download quality is Atmos (or max_track_quality is spatial).
+            QualityEnum.ATMOS: [
                 "SPATIAL_RA360",
                 "SPATIAL_ATMOS",
-            ]
+            ],
+        }
         
         self.tier_parse = {
             AmazonMusicTier.FREE: QualityEnum.MINIMUM,
@@ -631,9 +636,15 @@ class ModuleInterface:
                     mobile_session.credentials.account_region
                 )
 
+            effective_tier = (
+                QualityEnum(min(quality_tier.value, self.tier_parse[mobile_session.credentials.tier].value))
+                if not self.options.disable_subscription_check and not self.settings["use_own_master_keys"]
+                else quality_tier
+            )
             track_to_use = self._get_usable_audio_track_of_mapped_quailty(
                 mapped_audio_tracks=mapped_audio_tracks,
-                quality_tier=QualityEnum(min(quality_tier.value, self.tier_parse[mobile_session.credentials.tier].value)) if not self.options.disable_subscription_check and not self.settings["use_own_master_keys"] else quality_tier,
+                quality_tier=effective_tier,
+                codec_options=codec_options,
                 to_print=True,
             )
 
@@ -1216,12 +1227,12 @@ class ModuleInterface:
     def _amazon_spatial_display_label(codec_name: str = "", official_name: str = "") -> str:
         """Canonical spatial labels for search UI (small-caps via gui._to_small_caps)."""
         combined = f"{official_name} {codec_name}".lower()
-        if re.search(r"mpeg-h|mha1|mhm1", combined):
+        if re.search(r"mpeg-h|mha1|mhm1|\bra360\b", combined) or re.search(
+            r"\b360\b", combined
+        ):
             return "3D MPEG-H Audio"
         if re.search(r"e-ac-3|ac-4|\batmos\b|joc|dolby", combined):
             return "◗◖ ATMOS"
-        if "360" in combined:
-            return "360 Reality Audio"
         if (official_name or "").strip().upper() in ("3D", "ATMOS"):
             return "◗◖ ATMOS"
         raw = ModuleInterface._spatial_quality_label(
@@ -1283,6 +1294,110 @@ class ModuleInterface:
             return ""
         return max(labels, key=ModuleInterface._quality_display_sort_key)
 
+    def _collect_manifest_quality_labels(
+        self,
+        mapped_audio_tracks: dict[QualityEnum, dict[str, list[AudioTrack]]],
+    ) -> tuple[set[str], set[str]]:
+        """All distinct spatial and stereo tiers present in one MPD (for search badges)."""
+        spatial_labels: set[str] = set()
+        stereo_labels: set[str] = set()
+        quality_format = str(self.settings.get("quality_format", ""))
+        seen_spatial: set[str] = set()
+        seen_stereo: set[str] = set()
+
+        for _qe, _qn, tracks in self._iter_over_tracks_to_quality_map(mapped_audio_tracks):
+            if not tracks:
+                continue
+            best = tracks[0]
+            tier_key = str(best.quality or best.official_quality_name or "")
+            is_spatial = self._is_spatial_audio_track(best)
+            if is_spatial:
+                if tier_key in seen_spatial:
+                    continue
+                seen_spatial.add(tier_key)
+            else:
+                if tier_key in seen_stereo:
+                    continue
+                seen_stereo.add(tier_key)
+            if is_spatial or self._is_spatial_audio_track(best):
+                label = self._spatial_manifest_badge(best)
+                if not label:
+                    continue
+                spatial_labels.add(label)
+            else:
+                label = self._format_quality_display(
+                    {
+                        "official_quality_name": best.official_quality_name,
+                        "codec_pretty_name": codec_data[best.codec].pretty_name,
+                        "bit_depth": best.bit_depth,
+                        "sample_rate": best.sample_rate,
+                    },
+                    quality_format,
+                )
+                if not label:
+                    continue
+                stereo_labels.add(label)
+        return spatial_labels, stereo_labels
+
+    def _amazon_force_3d_for_manifest(self) -> bool:
+        """Match get_album_info / expand manifest requests (Atmos + UHD on same ASIN)."""
+        return any(
+            not self.settings.get("force_non_spatial", False)
+            or self.settings.get(key)
+            for key in ("prefer_spatial_mha1", "prefer_spatial_ac4")
+        )
+
+    def _probe_manifest_quality_label_sets(
+        self,
+        mobile_session: AmazonMusicMobileAPI,
+        track_asins: tuple[str, ...],
+        media_region: AmazonRegion,
+        *,
+        force_3d: bool,
+        per_track_stereo_label: bool = False,
+    ) -> tuple[set[str], set[str]]:
+        """
+        Discover tiers in the manifest for the given force_3d mode.
+
+        Amazon's try3dAsinSubstitution (force_3d=True) exposes Atmos but often drops UHD;
+        force_3d=False is required for 192 kHz / stereo tiers (see azapi.get_tracks_manifest).
+        """
+        spatial_labels: set[str] = set()
+        stereo_labels: set[str] = set()
+        if not track_asins:
+            return spatial_labels, stereo_labels
+        for track_asin, manifest in mobile_session.get_tracks_manifest(
+            track_asins,
+            force_3d=force_3d,
+            region_to_use=media_region,
+        ):
+            if manifest is None:
+                continue
+            try:
+                mapped = self.mpd_to_quality_map(
+                    manifest,
+                    track_asin,
+                    mobile_session.credentials.tier,
+                    media_region,
+                    mobile_session.credentials.account_region,
+                )
+                spatial, stereo = self._collect_manifest_quality_labels(mapped)
+                spatial_labels |= spatial
+                stereo_labels |= stereo
+                if per_track_stereo_label and not force_3d:
+                    per_track = self._quality_label_from_mapped(
+                        mapped, SEARCH_PROBE_STEREO_TIER
+                    )
+                    if per_track and not self._is_spatial_quality_display(
+                        per_track, per_track
+                    ):
+                        stereo_labels.add(per_track)
+            except Exception as ex:
+                LOGGER.debug(
+                    "Manifest quality collect failed for %s: %s", track_asin, ex
+                )
+        return spatial_labels, stereo_labels
+
     def _probe_quality_labels(
         self,
         mobile_session: AmazonMusicMobileAPI,
@@ -1320,6 +1435,72 @@ class ModuleInterface:
             if ModuleInterface._is_spatial_quality_display(text, text):
                 return text
         return None
+
+    @staticmethod
+    def _spatial_label_is_atmos(text: str) -> bool:
+        combined = str(text or "").lower()
+        return bool(
+            re.search(r"e-ac-3|ac-4|\batmos\b|joc|dolby|◗", combined)
+            and not re.search(r"mpeg-h|mha1|mhm1|\bra360\b", combined)
+        )
+
+    @staticmethod
+    def _spatial_label_is_ra360(text: str) -> bool:
+        combined = str(text or "").lower()
+        if "3d mpeg-h" in combined or "spatial_ra360" in combined:
+            return True
+        return bool(
+            re.search(r"mpeg-h|mha1|mhm1", combined)
+            and not re.search(r"e-ac-3|ac-4|\batmos\b|joc|dolby|◗", combined)
+        )
+
+    @staticmethod
+    def _spatial_display_tokens(spatial_labels: typing.Iterable[str]) -> list[str]:
+        """Distinct spatial badges (Atmos and Sony 360RA are separate tiers)."""
+        has_atmos = False
+        has_ra360 = False
+        for label in spatial_labels or []:
+            text = str(label).strip()
+            if not text:
+                continue
+            display = ModuleInterface._amazon_manifest_label_for_display(text)
+            if ModuleInterface._spatial_label_is_atmos(text) or display == "◗◖ ATMOS":
+                has_atmos = True
+            if ModuleInterface._spatial_label_is_ra360(text) or display == "3D MPEG-H Audio":
+                has_ra360 = True
+        tokens: list[str] = []
+        if has_atmos:
+            tokens.append("◗◖ ATMOS")
+        if has_ra360:
+            tokens.append("3D MPEG-H Audio")
+        return tokens
+
+    def _merge_manifest_quality_labels(
+        self,
+        spatial_labels: typing.Iterable[str],
+        stereo_labels: typing.Iterable[str],
+    ) -> list[str]:
+        """Build search Additional tokens: spatial first, then best non-spatial tier."""
+        result: list[str] = []
+        spatial_set = {str(label).strip() for label in spatial_labels if label and str(label).strip()}
+        stereo_set = {
+            str(label).strip()
+            for label in stereo_labels
+            if label
+            and str(label).strip()
+            and not self._is_spatial_quality_display(str(label), str(label))
+        }
+        if spatial_set:
+            for spatial_display in self._spatial_display_tokens(spatial_set):
+                if spatial_display and spatial_display not in result:
+                    result.append(spatial_display)
+        if stereo_set:
+            best_stereo = self._best_quality_display(stereo_set)
+            if best_stereo:
+                stereo_display = self._amazon_manifest_label_for_display(best_stereo)
+                if stereo_display and stereo_display not in result:
+                    result.append(stereo_display)
+        return result
 
     @staticmethod
     def _strip_legacy_bit_khz_suffix(text: str) -> str:
@@ -1383,9 +1564,8 @@ class ModuleInterface:
             "ultraHdAvailable": "Ultra HD",
             "atmosAvailable": "Dolby Atmos",
             "atmosavailable": "Dolby Atmos",
-            "ra360Available": "360 Reality Audio",
-            "ra360available": "360 Reality Audio",
-            "immersive": "Immersive Audio",
+            "ra360Available": "3D MPEG-H Audio",
+            "ra360available": "3D MPEG-H Audio",
         }
         tags: list[str] = []
 
@@ -1404,9 +1584,7 @@ class ModuleInterface:
             if "atmos" in kl:
                 return "Dolby Atmos"
             if "360" in kl or "ra360" in kl:
-                return "360 Reality Audio"
-            if "immersive" in kl:
-                return "Immersive Audio"
+                return "3D MPEG-H Audio"
             return None
 
         enc = entity.get("contentEncoding")
@@ -1432,7 +1610,7 @@ class ModuleInterface:
             ("uhdAvailable", "UHD"),
             ("hdAvailable", "HD"),
             ("atmosAvailable", "Dolby Atmos"),
-            ("ra360Available", "360 Reality Audio"),
+            ("ra360Available", "3D MPEG-H Audio"),
         ):
             if entity.get(flag_key) in (True, "true", "True", 1):
                 _add(label)
@@ -1463,6 +1641,11 @@ class ModuleInterface:
         return float(sample_rate_khz) > 48.0 and int(bit_depth) >= 24
 
     @staticmethod
+    def _is_amazon_uhd_lossless(sample_rate_khz: float, bit_depth: int) -> bool:
+        """Amazon Ultra HD is commonly 48 kHz / 24-bit (catalog + MPD UHD tier)."""
+        return float(sample_rate_khz) >= 48.0 and int(bit_depth) >= 24
+
+    @staticmethod
     def _amazon_manifest_label_for_display(label: str) -> str:
         """MPD-derived label → ATMOS / kHz·bit / HI-RES / OPUS only (never catalog UHD flags)."""
         text = str(label or "").strip()
@@ -1472,10 +1655,15 @@ class ModuleInterface:
             return ModuleInterface._amazon_spatial_display_label(text, "")
         if re.search(r"\bopus\s+only\b", text, re.IGNORECASE):
             return "OPUS only"
+        if re.search(r"\b(?:uhd|ultra\s*hd)\b", text, re.IGNORECASE):
+            return "🅷 HI-RES"
         parsed = ModuleInterface._parse_khz_bit_display_label(text)
         if parsed:
             sr_khz, bit_depth = parsed
-            if ModuleInterface._is_hi_res_lossless(sr_khz, bit_depth):
+            if (
+                ModuleInterface._is_hi_res_lossless(sr_khz, bit_depth)
+                or ModuleInterface._is_amazon_uhd_lossless(sr_khz, bit_depth)
+            ):
                 return "🅷 HI-RES"
             return text
         return text
@@ -1486,16 +1674,27 @@ class ModuleInterface:
         lower = [str(t).strip().lower() for t in tags if t]
         if not lower:
             return []
+        out: list[str] = []
         if any("atmos" in tl or tl == "dolby atmos" for tl in lower):
-            return ["◗◖ ATMOS"]
-        if any("immersive" in tl for tl in lower):
-            return ["IMMERSIVE AUDIO"]
-        if any("360" in tl for tl in lower):
-            return ["360 Reality Audio"]
-        if any(tl == "hd" for tl in lower) or any(
-            tl in ("uhd", "ultra hd", "ultra_hd", "ultrahd") or "ultra" in tl for tl in lower
+            out.append("◗◖ ATMOS")
+        if any(
+            "ra360" in tl or tl in ("360 reality audio",) or "mpeg-h" in tl
+            for tl in lower
         ):
-            return ["FLAC"]
+            if "3D MPEG-H Audio" not in out:
+                out.append("3D MPEG-H Audio")
+        has_uhd = any(
+            tl in ("uhd", "ultra hd", "ultra_hd", "ultrahd") or "ultra" in tl for tl in lower
+        )
+        has_hd = any(tl == "hd" for tl in lower)
+        if has_uhd:
+            if "🅷 HI-RES" not in out:
+                out.append("🅷 HI-RES")
+        elif has_hd:
+            if "FLAC" not in out:
+                out.append("FLAC")
+        if out:
+            return out
         return [str(t) for t in tags if t]
 
     @staticmethod
@@ -1506,6 +1705,63 @@ class ModuleInterface:
             if "atmos" in low or "◗" in text or "immersive" in low:
                 return True
         return False
+
+    @staticmethod
+    def _manifest_labels_include_stereo(labels: typing.Iterable[str]) -> bool:
+        for label in labels or []:
+            text = str(label)
+            low = text.lower()
+            if "hi-res" in low or "🅷" in text:
+                return True
+            if re.search(r"\d+(?:\.\d+)?\s*kHz", text, re.I):
+                return True
+            if text.strip().upper() == "FLAC" or re.search(r"\bopus\s+only\b", low):
+                return True
+        return False
+
+    @staticmethod
+    def _catalog_quality_tags_from_entity_and_tracks(entity: dict) -> list[str]:
+        """Album/playlist encoding flags from the entity and each track row."""
+        tags: list[str] = []
+        seen: set[str] = set()
+
+        def _add_from(source: dict):
+            for tag in ModuleInterface._quality_labels_from_entity(source):
+                if tag not in seen:
+                    seen.add(tag)
+                    tags.append(tag)
+
+        if not isinstance(entity, dict):
+            return tags
+        _add_from(entity)
+        for track in entity.get("tracks") or []:
+            if isinstance(track, dict):
+                _add_from(track)
+        return tags
+
+    def _supplement_stereo_quality_from_catalog(
+        self,
+        manifest_labels: list[str],
+        item: dict,
+        catalog: typing.Optional[dict] = None,
+    ) -> list[str]:
+        """When manifest probe found Atmos only, add catalog UHD/HD if present."""
+        if not manifest_labels or not self._quality_labels_include_atmos(manifest_labels):
+            return manifest_labels
+        if self._manifest_labels_include_stereo(manifest_labels):
+            return manifest_labels
+        merged = list(manifest_labels)
+        for entity in (catalog, item):
+            if not isinstance(entity, dict):
+                continue
+            tags = self._catalog_quality_tags_from_entity_and_tracks(entity)
+            for label in self._amazon_catalog_quality_display_labels(tags):
+                text = str(label)
+                if self._is_spatial_quality_display(text, text) or "◗" in text:
+                    continue
+                if text not in merged:
+                    merged.append(text)
+        return merged
 
     @staticmethod
     def _catalog_atmos_display_label(entity: dict) -> typing.Optional[str]:
@@ -1530,24 +1786,20 @@ class ModuleInterface:
         if not track_asin:
             return []
         try:
-            quality_tier = getattr(self.options, "quality_tier", None) or QualityEnum.HIGH
-            spatial_labels = self._probe_quality_labels(
-                mobile_session, (str(track_asin),), media_region, True, quality_tier
+            spatial_labels, _ = self._probe_manifest_quality_label_sets(
+                mobile_session,
+                (str(track_asin),),
+                media_region,
+                force_3d=True,
             )
-            if spatial_labels:
-                spatial_label = self._pick_spatial_display_label(
-                    spatial_labels
-                ) or next(iter(spatial_labels))
-                return [self._amazon_manifest_label_for_display(spatial_label)]
-            stereo_labels = self._probe_quality_labels(
-                mobile_session, (str(track_asin),), media_region, False, quality_tier
+            _, stereo_labels = self._probe_manifest_quality_label_sets(
+                mobile_session,
+                (str(track_asin),),
+                media_region,
+                force_3d=False,
+                per_track_stereo_label=True,
             )
-            if not stereo_labels:
-                return []
-            best = self._best_quality_display(stereo_labels)
-            if not best:
-                return []
-            return [self._amazon_manifest_label_for_display(best)]
+            return self._merge_manifest_quality_labels(spatial_labels, stereo_labels)
         except Exception as ex:
             LOGGER.debug("Track search manifest quality probe failed for %s: %s", track_asin, ex)
             return []
@@ -1988,40 +2240,110 @@ class ModuleInterface:
                     track_asins.append(str(asin))
         if not track_asins:
             return None
-        probe_asins = self._sample_track_asins_for_quality_probe(
-            track_asins, max_probe=max_track_probe
-        )
-        try:
-            quality_tier = getattr(self.options, "quality_tier", None) or QualityEnum.HIGH
-            # Fast path: sample a few stereo/lossless/opus manifests.
-            stereo_labels = self._probe_quality_labels(
-                mobile_session, probe_asins, media_region, False, quality_tier
+        # Mixed-quality albums (e.g. some 192 kHz / 24-bit, some 44.1 / 16-bit) need more
+        # than a 3-track sample — use the same per-track manifest pass as expand/download.
+        if query_type == DownloadTypeEnum.album:
+            probe_asins = tuple(track_asins)
+        else:
+            probe_asins = self._sample_track_asins_for_quality_probe(
+                track_asins, max_probe=max_track_probe
             )
-            # Always probe spatial on the first track (one extra call) — pure Atmos albums
-            # only expose 3D/Dolby tiers when force_3d is enabled.
-            spatial_labels: set[str] = set()
-            if probe_asins:
-                spatial_labels = self._probe_quality_labels(
-                    mobile_session,
-                    (probe_asins[0],),
-                    media_region,
-                    True,
-                    quality_tier,
-                )
-            if spatial_labels:
-                spatial_label = self._pick_spatial_display_label(
-                    spatial_labels
-                ) or next(iter(spatial_labels))
-                return [self._amazon_manifest_label_for_display(spatial_label)]
-            if not stereo_labels:
-                return None
-            best = self._best_quality_display(stereo_labels)
-            if not best:
-                return None
-            return [self._amazon_manifest_label_for_display(best)]
+        try:
+            return self._album_search_quality_labels(
+                mobile_session,
+                probe_asins,
+                media_region,
+            )
         except Exception as ex:
             LOGGER.debug("Search manifest quality probe failed: %s", ex)
             return None
+
+    def _stereo_only_quality_labels(self, labels: typing.Iterable[str]) -> set[str]:
+        return {
+            str(label).strip()
+            for label in labels
+            if label
+            and str(label).strip()
+            and not self._is_spatial_quality_display(str(label), str(label))
+        }
+
+    def _album_search_quality_labels(
+        self,
+        mobile_session: AmazonMusicMobileAPI,
+        track_asins: tuple[str, ...],
+        media_region: AmazonRegion,
+    ) -> typing.Optional[list[str]]:
+        """
+        Same manifest + per-track label pass as get_album_info / expand (force_3d from settings).
+        Optional second pass with force_3d=False when Amazon omits UHD on the 3D substitution ASIN.
+        """
+        if not track_asins:
+            return None
+
+        spatial_labels: set[str] = set()
+        per_track_labels: set[str] = set()
+        collected_stereo: set[str] = set()
+        has_ra360_manifest: bool = False
+        force_3d = self._amazon_force_3d_for_manifest()
+
+        def _ingest_manifests(force_3d_flag: bool) -> None:
+            nonlocal has_ra360_manifest
+            for track_asin, manifest in mobile_session.get_tracks_manifest(
+                track_asins,
+                force_3d=force_3d_flag,
+                region_to_use=media_region,
+            ):
+                if manifest is None:
+                    continue
+                try:
+                    mapped = self.mpd_to_quality_map(
+                        manifest,
+                        track_asin,
+                        mobile_session.credentials.tier,
+                        media_region,
+                        mobile_session.credentials.account_region,
+                    )
+                    if self._mapped_has_spatial_prefix(mapped, "SPATIAL_RA360"):
+                        has_ra360_manifest = True
+                    spatial, stereo = self._collect_manifest_quality_labels(mapped)
+                    spatial_labels |= spatial
+                    collected_stereo |= stereo
+                    label = self._quality_label_from_mapped(
+                        mapped, SEARCH_PROBE_STEREO_TIER
+                    )
+                    if label:
+                        per_track_labels.add(label)
+                except Exception as ex:
+                    LOGGER.debug(
+                        "Album search manifest ingest failed for %s: %s",
+                        track_asin,
+                        ex,
+                    )
+
+        _ingest_manifests(force_3d)
+
+        stereo_candidates = self._stereo_only_quality_labels(
+            per_track_labels | collected_stereo
+        )
+        if not self._manifest_labels_include_stereo(stereo_candidates):
+            _ingest_manifests(False)
+            stereo_candidates = self._stereo_only_quality_labels(
+                per_track_labels | collected_stereo
+            )
+
+        if not spatial_labels and track_asins:
+            spatial_only, _ = self._probe_manifest_quality_label_sets(
+                mobile_session,
+                (track_asins[0],),
+                media_region,
+                force_3d=True,
+            )
+            spatial_labels |= spatial_only
+
+        merged = self._merge_manifest_quality_labels(spatial_labels, stereo_candidates)
+        if merged and "3D MPEG-H Audio" in merged and not has_ra360_manifest:
+            merged = [label for label in merged if label != "3D MPEG-H Audio"]
+        return merged or None
 
     def artist_album_display_meta(
         self, album_catalog: dict, media_region: AmazonRegion
@@ -2184,7 +2506,9 @@ class ModuleInterface:
                         atmos = self._catalog_atmos_display_label(catalog) or self._catalog_atmos_display_label(item)
                         if atmos:
                             return [atmos]
-                    return manifest_labels
+                    return self._supplement_stereo_quality_from_catalog(
+                        manifest_labels, item, catalog
+                    )
             if query_type == DownloadTypeEnum.track:
                 track_asin = item.get("asin")
                 if track_asin:
@@ -2198,13 +2522,19 @@ class ModuleInterface:
                             )
                             if atmos:
                                 return [atmos]
-                        return probed
-            labels = self._quality_labels_from_entity(item)
-            if not labels and catalog:
-                labels = self._quality_labels_from_entity(catalog)
-            if labels:
-                return self._amazon_catalog_quality_display_labels(labels)
-            return labels
+                        return self._supplement_stereo_quality_from_catalog(
+                            probed, item, catalog
+                        )
+            tags: list[str] = []
+            if isinstance(item, dict):
+                tags.extend(self._catalog_quality_tags_from_entity_and_tracks(item))
+            if isinstance(catalog, dict):
+                for tag in self._catalog_quality_tags_from_entity_and_tracks(catalog):
+                    if tag not in tags:
+                        tags.append(tag)
+            if tags:
+                return self._amazon_catalog_quality_display_labels(tags)
+            return []
 
         def _build_search_result(item: dict) -> SearchResult:
             asin = item.get("asin") or item.get("seriesAsin")
@@ -2241,6 +2571,10 @@ class ModuleInterface:
             )
 
         if query_type in (DownloadTypeEnum.album, DownloadTypeEnum.playlist) and len(results) > 1:
+            # Album search probes every track's manifest; run sequentially so the shared
+            # mobile session + manifest API are not hammered from multiple threads.
+            if query_type == DownloadTypeEnum.album:
+                return [_build_search_result(item) for item in results]
             search_output: list[SearchResult] = []
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(4, len(results))
@@ -2482,95 +2816,197 @@ class ModuleInterface:
             indent_level=indent,
         )
 
+    def _print_quality_notice_once(self, key: str, message: str) -> None:
+        """Avoid per-track spam when max_track_quality_to_use applies to a whole album."""
+        with self._quality_notice_lock:
+            if key in self._quality_notice_seen:
+                return
+            self._quality_notice_seen.add(key)
+        self.print(message)
+
+    @staticmethod
+    def _is_spatial_audio_track(track: AudioTrack) -> bool:
+        return bool(codec_data[track.codec].spatial)
+
+    @staticmethod
+    def _is_ra360_audio_track(track: AudioTrack) -> bool:
+        quality = str(track.quality or "").upper()
+        if quality.startswith("SPATIAL_RA360"):
+            return True
+        return track.codec in (CodecEnum.MHA1, CodecEnum.MHM1)
+
+    @staticmethod
+    def _is_atmos_audio_track(track: AudioTrack) -> bool:
+        quality = str(track.quality or "").upper()
+        if quality.startswith("SPATIAL_ATMOS"):
+            return True
+        return track.codec in (CodecEnum.EAC3, CodecEnum.AC4)
+
+    @staticmethod
+    def _spatial_manifest_badge(track: AudioTrack) -> str:
+        """Search/download badge from MPD track type + codec (not catalog 'immersive')."""
+        if ModuleInterface._is_ra360_audio_track(track):
+            return "3D MPEG-H Audio"
+        if ModuleInterface._is_atmos_audio_track(track):
+            return "◗◖ ATMOS"
+        if ModuleInterface._is_spatial_audio_track(track):
+            codec_name = codec_data[track.codec].pretty_name
+            official = str(track.official_quality_name or "")
+            return ModuleInterface._amazon_spatial_display_label(codec_name, official)
+        return ""
+
+    @staticmethod
+    def _mapped_has_spatial_prefix(
+        mapped_audio_tracks: dict[QualityEnum, dict[str, list[AudioTrack]]],
+        prefix: str,
+    ) -> bool:
+        want = str(prefix or "").upper()
+        for _qe, _qn, tracks in ModuleInterface._iter_over_tracks_to_quality_map(
+            mapped_audio_tracks
+        ):
+            for track in tracks:
+                if str(track.quality or "").upper().startswith(want):
+                    return True
+        return False
+
+    @staticmethod
+    def _quality_prefix_is_spatial(quality_prefix: str) -> bool:
+        return str(quality_prefix or "").upper().startswith("SPATIAL")
+
+    def _select_track_for_quality_prefix(
+        self,
+        mapped_audio_tracks: dict[QualityEnum, dict[str, list[AudioTrack]]],
+        quality_enum: QualityEnum,
+        quality_prefix: str,
+        *,
+        spatial_only: bool,
+        stereo_only: bool,
+    ) -> AudioTrack | None:
+        tier_tracks = mapped_audio_tracks.get(quality_enum) or {}
+        for _group_name, tracks in tier_tracks.items():
+            if not tracks:
+                continue
+            for track in tracks:
+                if not track.quality.startswith(quality_prefix):
+                    continue
+                is_spatial = self._is_spatial_audio_track(track)
+                if stereo_only and is_spatial:
+                    continue
+                if spatial_only and not is_spatial:
+                    continue
+                return track
+        return None
+
+    def _select_audio_track_for_tier(
+        self,
+        mapped_audio_tracks: dict[QualityEnum, dict[str, list[AudioTrack]]],
+        quality_tier: QualityEnum,
+        codec_options: typing.Optional[CodecOptions] = None,
+        *,
+        to_print: bool = False,
+    ) -> AudioTrack | None:
+        allow_spatial = True
+        if codec_options is not None and not codec_options.spatial_codecs:
+            allow_spatial = False
+        if self.settings.get("force_non_spatial", False):
+            allow_spatial = False
+
+        want_spatial = (
+            allow_spatial
+            and quality_tier.value >= QualityEnum.ATMOS.value
+        )
+
+        tier_order: list[tuple[QualityEnum, list[str]]] = []
+        for quality_enum in reversed(QualityEnum):
+            if quality_enum.value > quality_tier.value:
+                continue
+            prefixes = self.quality_parse.get(quality_enum)
+            if not prefixes:
+                continue
+            tier_order.append((quality_enum, prefixes))
+
+        if want_spatial:
+            for quality_enum, prefixes in tier_order:
+                for quality_prefix in prefixes:
+                    if not self._quality_prefix_is_spatial(quality_prefix):
+                        continue
+                    track = self._select_track_for_quality_prefix(
+                        mapped_audio_tracks,
+                        quality_enum,
+                        quality_prefix,
+                        spatial_only=True,
+                        stereo_only=False,
+                    )
+                    if track:
+                        if to_print:
+                            self._print_quality_notice_once(
+                                f"spatial:{track.quality}",
+                                f"{module_information.service_name}: Downloading spatial audio "
+                                f"({track.quality}).",
+                            )
+                        return track
+
+        for quality_enum, prefixes in tier_order:
+            for quality_prefix in prefixes:
+                if self._quality_prefix_is_spatial(quality_prefix):
+                    continue
+                track = self._select_track_for_quality_prefix(
+                    mapped_audio_tracks,
+                    quality_enum,
+                    quality_prefix,
+                    spatial_only=False,
+                    stereo_only=True,
+                )
+                if track:
+                    return track
+
+        return None
+
     def _get_usable_audio_track_of_mapped_quailty(
         self,
         mapped_audio_tracks: dict[QualityEnum, dict[str, list[AudioTrack]]],
         quality_tier: QualityEnum,
+        codec_options: typing.Optional[CodecOptions] = None,
         to_print: typing.Optional[bool] = False,
     ):
         track_to_use: AudioTrack | None = None
-        # I tried, ok?
-        # Attempt to find and choose preferred quality (has to be the same returned in the MPD)
         mapped_qual_tracks = list(
             self._iter_over_tracks_to_quality_map(mapped_audio_tracks)
         )
 
         if max_track_quality_to_use := self.settings["max_track_quality_to_use"]:
             max_track_quality_to_use = str(max_track_quality_to_use).upper()
-            for (
-                quality_enum,
-                quality_name,
-                tracks,
-            ) in mapped_qual_tracks:
+            for _quality_enum, _quality_name, tracks in mapped_qual_tracks:
                 if not tracks:
                     continue
-
-                # Check if the selected MPD quality to use is valid
-                if max_track_quality_to_use not in quality_name:
-                    continue
-
-                if to_print:
-                    self.print(
-                        f"{module_information.service_name}: Downloading in {quality_name} as it is matched with {max_track_quality_to_use}."
-                    )
-
                 for track in tracks:
-                    if not (track.quality.startswith(max_track_quality_to_use)):
+                    if not track.quality.startswith(max_track_quality_to_use):
                         continue
                     track_to_use = track
                     break
-                else:
-                    continue
-                break
-
-            if not track_to_use and to_print:
-                self.print(
-                    f"{module_information.service_name}: Failed to find {max_track_quality_to_use!r}, defaulting to highest avaliable."
-                )
-
-        # Handle 360RA files seperately because Amazon ranks 360RA differently
-        if not track_to_use:
-            if item := list(i for i in mapped_qual_tracks if "RA360" in i[1]):
-                # Get the last item (max quality) list of tuple and get the first item inside tracks
-                track_to_use = item[-1][-1][0]
-
-        # If max_track_quality_to_use is not set or failed, then use the global quality to use
-        if not track_to_use:
-            for (
-                quality_enum,
-                quality_name,
-                tracks,
-            ) in mapped_qual_tracks:
-                # self.print(f"{quality_enum=}, {quality_name=}, {tracks=}")
-                # pprint.pprint(mapped_qual_tracks)
-                if not tracks:
-                    continue
-
-                # tracks are sorted highest-bitrate first; tracks[0] is always chosen below.
-                # Skip the multi-tier notice when we already take the best manifest tier.
-                if len(tracks) > 1 and to_print:
-                    best_bitrate = max(t.bitrate for t in tracks)
-                    if tracks[0].bitrate < best_bitrate:
-                        self.print(
-                            (
-                                f"{module_information.service_name}: "
-                                f"There are more than one tracks avaliable for {quality_name}. "
-                                f"\nAvaliable qualities: "
-                            )
-                            + (
-                                "".join(
-                                    f"{module_information.service_name}: {item.quality} with ranking {tracks.index(item) + 1}, "
-                                    for item in tracks
-                                )
-                            )
+                if track_to_use:
+                    if to_print:
+                        self._print_quality_notice_once(
+                            f"matched:{max_track_quality_to_use}",
+                            f"{module_information.service_name}: Using {max_track_quality_to_use} "
+                            "quality where available.",
                         )
-
-                if quality_enum.value <= quality_tier.value:
-                    track_to_use = tracks[0]
                     break
 
-                continue
-        
+            if not track_to_use and to_print:
+                self._print_quality_notice_once(
+                    f"fallback:{max_track_quality_to_use}",
+                    f"{module_information.service_name}: {max_track_quality_to_use} is not on every "
+                    "track; using the highest available quality where needed.",
+                )
+
+        if not track_to_use:
+            track_to_use = self._select_audio_track_for_tier(
+                mapped_audio_tracks,
+                quality_tier,
+                codec_options,
+                to_print=bool(to_print),
+            )
 
         if not isinstance(track_to_use, AudioTrack):
             raise TypeError(f"{track_to_use=}, type: {type(track_to_use)}")
