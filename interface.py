@@ -1734,9 +1734,16 @@ class ModuleInterface:
         if not isinstance(entity, dict):
             return tags
         _add_from(entity)
+        meta = entity.get("metadata")
+        if isinstance(meta, dict):
+            _add_from(meta)
         for track in entity.get("tracks") or []:
             if isinstance(track, dict):
                 _add_from(track)
+                # Playlist tracks carry contentEncoding under a nested metadata dict.
+                track_meta = track.get("metadata")
+                if isinstance(track_meta, dict):
+                    _add_from(track_meta)
         return tags
 
     def _supplement_stereo_quality_from_catalog(
@@ -2075,41 +2082,123 @@ class ModuleInterface:
         self.print(
             f"{module_information.service_name}: Loading albums for {artist_data['name']}, this may take a while.."
         )
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {
-                executor.submit(
-                    mobile_session.get_album_info, album["asin"], region_to_use=media_region
-                ): album
-                for album in mobile_session.search(
-                    query=f'"{artist_name}"',
-                    search_types=("catalog_album",),
-                    limit=100,
-                    region_to_use=media_region
+
+        # Candidate albums from the artist catalog search.
+        search_albums = [
+            album
+            for album in mobile_session.search(
+                query=f'"{artist_name}"',
+                search_types=("catalog_album",),
+                limit=100,
+                region_to_use=media_region,
+            )
+            if artist_name in album.get("artistName", "")
+        ]
+        # Map requested ASIN -> search hit so we can pair batched metadata back to it.
+        search_by_asin: dict[str, dict] = {}
+        for album in search_albums:
+            asin = album.get("asin")
+            if asin:
+                search_by_asin.setdefault(str(asin), album)
+
+        def _match_search_hit(album_metadata: dict) -> typing.Optional[dict]:
+            for key in ("requestedAsin", "asin", "globalAsin"):
+                asin = album_metadata.get(key)
+                if asin and str(asin) in search_by_asin:
+                    return search_by_asin[str(asin)]
+            return None
+
+        # The muse lookup endpoint accepts up to 10 ASINs per request, so batch
+        # metadata fetches (94 single calls -> ~10 batched calls) and run them
+        # concurrently. Full album details (tracks, year, quality flags) are
+        # preserved because each entry is the same payload as get_album_info.
+        all_asins = list(search_by_asin.keys())
+        asin_batches = [all_asins[i : i + 10] for i in range(0, len(all_asins), 10)]
+
+        def _fetch_batch(asin_batch: list[str]) -> list[dict]:
+            try:
+                resp = mobile_session.get_metadata(
+                    tuple(asin_batch), region_to_use=media_region
                 )
-                if artist_name in album.get("artistName", "")
-            }
-            executor.shutdown(wait=True)
-            for future in concurrent.futures.as_completed(futures):
-                album_metadata = future.result()
-                if not album_metadata:
-                    continue
-                album = futures[future]
-                # Filter out foreign albums with the same artist name (but not ID)
-                if (
-                    not album_metadata["artist"]["contributorAsins"]
-                    and album_metadata["artist"]["asin"] != artist_id
-                ):
-                    continue
+                return list(resp.get("albumList") or [])
+            except Exception as ex:
+                LOGGER.debug("Album metadata batch failed (%s): %s", asin_batch, ex)
+                return []
 
-                # Assume that if they aren't equal, they are credited albums
-                # artist_id != album.get("artistAsin")
-                if (
-                    artist_name != album.get("artistName", "")
-                ) and not get_credited_albums:
-                    continue
+        fetched_metadata: list[dict] = []
+        matched_asins: set[str] = set()
+        if asin_batches:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, len(asin_batches))
+            ) as executor:
+                batch_futures = [
+                    executor.submit(_fetch_batch, batch) for batch in asin_batches
+                ]
+                executor.shutdown(wait=True)
+                for future in concurrent.futures.as_completed(batch_futures):
+                    for album_metadata in future.result():
+                        if not album_metadata:
+                            continue
+                        fetched_metadata.append(album_metadata)
+                        hit = _match_search_hit(album_metadata)
+                        if hit is not None and hit.get("asin"):
+                            matched_asins.add(str(hit["asin"]))
 
-                albums_metadata.append(album_metadata)
-                albums.append(album)
+        # Fallback: fetch any ASINs the batched lookup silently dropped.
+        missing_asins = [a for a in all_asins if a not in matched_asins]
+        if missing_asins:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(8, len(missing_asins))
+            ) as executor:
+                single_futures = {
+                    executor.submit(
+                        mobile_session.get_album_info,
+                        asin,
+                        region_to_use=media_region,
+                    ): asin
+                    for asin in missing_asins
+                }
+                executor.shutdown(wait=True)
+                for future in concurrent.futures.as_completed(single_futures):
+                    try:
+                        album_metadata = future.result()
+                    except Exception as ex:
+                        LOGGER.debug(
+                            "Album metadata fallback failed (%s): %s",
+                            single_futures[future],
+                            ex,
+                        )
+                        continue
+                    if album_metadata:
+                        fetched_metadata.append(album_metadata)
+
+        added_asins: set[str] = set()
+        for album_metadata in fetched_metadata:
+            if not album_metadata:
+                continue
+            album = _match_search_hit(album_metadata)
+            if album is None:
+                continue
+            album_asin = str(album.get("asin") or "")
+            if album_asin in added_asins:
+                continue
+            # Filter out foreign albums with the same artist name (but not ID)
+            if (
+                not album_metadata["artist"]["contributorAsins"]
+                and album_metadata["artist"]["asin"] != artist_id
+            ):
+                continue
+
+            # Assume that if they aren't equal, they are credited albums
+            # artist_id != album.get("artistAsin")
+            if (
+                artist_name != album.get("artistName", "")
+            ) and not get_credited_albums:
+                continue
+
+            added_asins.add(album_asin)
+            albums_metadata.append(album_metadata)
+            albums.append(album)
 
         if not albums:
             self.print(f"No albums found for {artist_name} with ID: {artist_id}.")
@@ -2240,14 +2329,10 @@ class ModuleInterface:
                     track_asins.append(str(asin))
         if not track_asins:
             return None
-        # Mixed-quality albums (e.g. some 192 kHz / 24-bit, some 44.1 / 16-bit) need more
-        # than a 3-track sample — use the same per-track manifest pass as expand/download.
-        if query_type == DownloadTypeEnum.album:
-            probe_asins = tuple(track_asins)
-        else:
-            probe_asins = self._sample_track_asins_for_quality_probe(
-                track_asins, max_probe=max_track_probe
-            )
+        # Search rows only sample a few tracks; expand/download still inspects every track.
+        probe_asins = self._sample_track_asins_for_quality_probe(
+            track_asins, max_probe=max_track_probe
+        )
         try:
             return self._album_search_quality_labels(
                 mobile_session,
@@ -2346,9 +2431,17 @@ class ModuleInterface:
         return merged or None
 
     def artist_album_display_meta(
-        self, album_catalog: dict, media_region: AmazonRegion
+        self,
+        album_catalog: dict,
+        media_region: AmazonRegion,
+        search_hit: typing.Optional[dict] = None,
     ) -> dict[str, typing.Any]:
-        """Year, track count, and best quality for artist discography rows (matches album search)."""
+        """Year, track count, and best quality for artist discography rows (matches album search).
+
+        Quality is read from local catalog contentEncoding flags only (no per-album
+        manifest probe), so expanding a large discography stays fast. The exact tier
+        is still refined from the MPD manifest on expand/download.
+        """
         year = ""
         try:
             if album_catalog.get("originalReleaseDate") or album_catalog.get("merchantReleaseDate"):
@@ -2373,15 +2466,17 @@ class ModuleInterface:
             except (TypeError, ValueError):
                 pass
 
-        try:
-            mobile_session, _ = self.select_session(media_region)
-            quality_labels = self._search_additional_quality_labels(
-                mobile_session, album_catalog, media_region, DownloadTypeEnum.album
-            )
+        # Gather catalog quality flags from the full metadata (and its tracks) plus the
+        # original search hit, which reliably carries contentEncoding flags.
+        catalog_tags = self._catalog_quality_tags_from_entity_and_tracks(album_catalog)
+        if isinstance(search_hit, dict):
+            for tag in self._catalog_quality_tags_from_entity_and_tracks(search_hit):
+                if tag not in catalog_tags:
+                    catalog_tags.append(tag)
+        if catalog_tags:
+            quality_labels = self._amazon_catalog_quality_display_labels(catalog_tags)
             if quality_labels:
                 additional_parts.extend(quality_labels)
-        except Exception as ex:
-            LOGGER.debug("Artist album quality probe failed: %s", ex)
 
         title = str(album_catalog.get("title") or "")
         explicit = any(
@@ -2444,6 +2539,24 @@ class ModuleInterface:
                 return str(album_art["url"])
             return None
 
+        def _track_album_asin(item: dict) -> typing.Optional[str]:
+            """Best-effort album ASIN for a track search hit (used to backfill year)."""
+            sources = [item]
+            meta = item.get("metadata")
+            if isinstance(meta, dict):
+                sources.append(meta)
+            for src in sources:
+                if not isinstance(src, dict):
+                    continue
+                for key in ("albumAsin", "albumGlobalAsin"):
+                    val = src.get(key)
+                    if val:
+                        return str(val)
+                album = src.get("album")
+                if isinstance(album, dict) and album.get("asin"):
+                    return str(album["asin"])
+            return None
+
         def _fetch_catalog_entity_for_search(item: dict) -> typing.Optional[dict]:
             """Full album/playlist metadata (text search hits omit year, duration, quality)."""
             asin = item.get("asin") or item.get("seriesAsin")
@@ -2494,10 +2607,36 @@ class ModuleInterface:
             return None
 
         def _quality_for_search_item(item: dict, catalog: typing.Optional[dict] = None) -> list[str]:
+            catalog_tags: list[str] = []
+            if isinstance(item, dict):
+                catalog_tags.extend(
+                    self._catalog_quality_tags_from_entity_and_tracks(item)
+                )
+            if isinstance(catalog, dict):
+                for tag in self._catalog_quality_tags_from_entity_and_tracks(catalog):
+                    if tag not in catalog_tags:
+                        catalog_tags.append(tag)
+
             if catalog and query_type in (
                 DownloadTypeEnum.album,
                 DownloadTypeEnum.playlist,
             ):
+                # Prefer catalog HD/UHD/Atmos flags (no MPD round-trips) when Amazon already sent them.
+                if catalog_tags:
+                    catalog_labels = self._amazon_catalog_quality_display_labels(
+                        catalog_tags
+                    )
+                    if catalog_labels:
+                        if not self._quality_labels_include_atmos(catalog_labels):
+                            atmos = self._catalog_atmos_display_label(
+                                catalog
+                            ) or self._catalog_atmos_display_label(item)
+                            if atmos:
+                                return [atmos]
+                        return self._supplement_stereo_quality_from_catalog(
+                            catalog_labels, item, catalog
+                        )
+
                 manifest_labels = self._search_additional_quality_labels(
                     mobile_session, catalog, media_region, query_type
                 )
@@ -2525,16 +2664,29 @@ class ModuleInterface:
                         return self._supplement_stereo_quality_from_catalog(
                             probed, item, catalog
                         )
-            tags: list[str] = []
-            if isinstance(item, dict):
-                tags.extend(self._catalog_quality_tags_from_entity_and_tracks(item))
-            if isinstance(catalog, dict):
-                for tag in self._catalog_quality_tags_from_entity_and_tracks(catalog):
-                    if tag not in tags:
-                        tags.append(tag)
-            if tags:
-                return self._amazon_catalog_quality_display_labels(tags)
+            if catalog_tags:
+                return self._amazon_catalog_quality_display_labels(catalog_tags)
             return []
+
+        # Filled in below for track searches whose lightweight hits omit a release
+        # date; maps album ASIN -> year via a few batched album-metadata lookups.
+        album_year_backfill: dict[str, str] = {}
+
+        def _resolve_year(item: dict, catalog: typing.Optional[dict]) -> typing.Optional[str]:
+            if query_type not in (
+                DownloadTypeEnum.track,
+                DownloadTypeEnum.album,
+                DownloadTypeEnum.playlist,
+            ):
+                return None
+            year = _search_release_year(item, catalog)
+            if year:
+                return year
+            if query_type == DownloadTypeEnum.track:
+                album_asin = _track_album_asin(item)
+                if album_asin:
+                    return album_year_backfill.get(album_asin)
+            return None
 
         def _build_search_result(item: dict) -> SearchResult:
             asin = item.get("asin") or item.get("seriesAsin")
@@ -2550,14 +2702,7 @@ class ModuleInterface:
                 result_id=asin,
                 name=item.get("title") or item.get("name"),
                 artists=artists,
-                year=_search_release_year(item, catalog)
-                if query_type
-                in (
-                    DownloadTypeEnum.track,
-                    DownloadTypeEnum.album,
-                    DownloadTypeEnum.playlist,
-                )
-                else None,
+                year=_resolve_year(item, catalog),
                 duration=_search_duration_seconds(item, catalog),
                 image_url=_cover_from_item(item),
                 explicit=item["parentalControls"]["hasExplicitLanguage"]
@@ -2570,9 +2715,62 @@ class ModuleInterface:
                 },
             )
 
+        if query_type == DownloadTypeEnum.track and results:
+            # Track search hits frequently omit a release date. Backfill the year
+            # from the owning album's metadata using batched lookups (up to 10
+            # ASINs per request) instead of one slow call per track.
+            needed_album_asins: list[str] = []
+            seen_album_asins: set[str] = set()
+            for item in results:
+                if not isinstance(item, dict) or _search_release_year(item, None):
+                    continue
+                album_asin = _track_album_asin(item)
+                if album_asin and album_asin not in seen_album_asins:
+                    seen_album_asins.add(album_asin)
+                    needed_album_asins.append(album_asin)
+
+            if needed_album_asins:
+                year_batches = [
+                    needed_album_asins[i : i + 10]
+                    for i in range(0, len(needed_album_asins), 10)
+                ]
+
+                def _fetch_year_batch(batch: list[str]) -> list[dict]:
+                    try:
+                        resp = mobile_session.get_metadata(
+                            tuple(batch), region_to_use=media_region
+                        )
+                        return list(resp.get("albumList") or [])
+                    except Exception as ex:
+                        LOGGER.debug(
+                            "Track-year album metadata batch failed (%s): %s", batch, ex
+                        )
+                        return []
+
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(8, len(year_batches))
+                ) as executor:
+                    year_futures = [
+                        executor.submit(_fetch_year_batch, batch)
+                        for batch in year_batches
+                    ]
+                    executor.shutdown(wait=True)
+                    for future in concurrent.futures.as_completed(year_futures):
+                        for album_meta in future.result():
+                            if not isinstance(album_meta, dict):
+                                continue
+                            year = self._year_from_date_fields(
+                                album_meta, self._ALBUM_YEAR_KEYS
+                            )
+                            if not year:
+                                continue
+                            for key in ("requestedAsin", "asin", "globalAsin"):
+                                asin_val = album_meta.get(key)
+                                if asin_val:
+                                    album_year_backfill[str(asin_val)] = year
+
         if query_type in (DownloadTypeEnum.album, DownloadTypeEnum.playlist) and len(results) > 1:
-            # Album search probes every track's manifest; run sequentially so the shared
-            # mobile session + manifest API are not hammered from multiple threads.
+            # Album rows: sequential catalog fetch + optional 3-track MPD sample (session not thread-safe).
             if query_type == DownloadTypeEnum.album:
                 return [_build_search_result(item) for item in results]
             search_output: list[SearchResult] = []
