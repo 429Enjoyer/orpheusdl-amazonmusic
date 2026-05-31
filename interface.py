@@ -3663,7 +3663,28 @@ class ModuleInterface:
         if ModuleInterface._try_mp4decrypt(enc_path, out_path, key_id, key):
             return
 
-        if last_returncode == 3221225477 or last_returncode == -1073741819:
+        detail_lower = (last_detail or "").lower()
+        # macOS: a too-new Shaka Packager build links libc++ symbols missing on older
+        # macOS, so it SIGABRTs (exit -6) with a dyld "Symbol not found" message.
+        macos_abi_crash = sys.platform == "darwin" and (
+            last_returncode == -6
+            or "symbol not found" in detail_lower
+            or "dyld" in detail_lower
+        )
+        windows_crash = last_returncode in (3221225477, -1073741819)
+        has_mp4decrypt = bool(resolve_mp4decrypt())
+
+        if macos_abi_crash:
+            last_detail = (
+                f"{last_detail}\n"
+                "The bundled Shaka Packager is incompatible with this macOS version "
+                "(it was built for a newer macOS and aborts on this one). "
+                "Fix: install the Bento4 mp4decrypt fallback — `brew install bento4` — "
+                "or download mp4decrypt from https://www.bento4.com/downloads/ and place it "
+                "inside the app at Contents/Frameworks/ (next to packager-osx-x64). "
+                "Then restart the app."
+            )
+        elif windows_crash:
             last_detail = (
                 f"{last_detail}\n"
                 "Shaka Packager crashed on this system (exit 3221225477). "
@@ -3671,12 +3692,24 @@ class ModuleInterface:
                 "https://www.bento4.com/downloads/ → Windows binaries zip → mp4decrypt.exe. "
                 "Or use a full Windows 10 VM instead of Tiny10."
             )
-        elif not resolve_mp4decrypt():
-            last_detail = (
-                f"{last_detail}\n"
-                "Optional: add mp4decrypt.exe from Bento4 next to the app folder "
-                "(https://www.bento4.com/downloads/) when Shaka Packager fails."
-            )
+        elif not has_mp4decrypt:
+            if sys.platform == "darwin":
+                hint = (
+                    "Optional: install the Bento4 mp4decrypt fallback (`brew install bento4`, "
+                    "or place mp4decrypt in the app's Contents/Frameworks/ folder) for when "
+                    "Shaka Packager fails."
+                )
+            elif sys.platform.startswith("linux"):
+                hint = (
+                    "Optional: install the Bento4 mp4decrypt fallback (e.g. your package "
+                    "manager or https://www.bento4.com/downloads/) for when Shaka Packager fails."
+                )
+            else:
+                hint = (
+                    "Optional: add mp4decrypt.exe from Bento4 next to the app folder "
+                    "(https://www.bento4.com/downloads/) when Shaka Packager fails."
+                )
+            last_detail = f"{last_detail}\n{hint}"
         raise subprocess.CalledProcessError(
             last_returncode,
             [str(executable), *packager_args],
