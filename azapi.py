@@ -429,6 +429,8 @@ class AmazonMusicMobileAPI:
         self,
         uri: str,
         count: typing.Optional[int] = None,
+        next_token: typing.Optional[str] = None,
+        offset: typing.Optional[int] = None,
         region_to_use: typing.Optional[AmazonRegion] = None
     ):
         """
@@ -488,8 +490,8 @@ class AmazonMusicMobileAPI:
                 "marketplaceId": None,
                 "musicRequestIdentityContextToken": None,
                 "musicTerritory": region_to_use.country,
-                "nextToken": None,
-                "offset": None,
+                "nextToken": next_token,
+                "offset": offset,
                 "requestedContent": "KATANA",
                 "sessionId": None,
                 "stub": False,
@@ -560,77 +562,161 @@ class AmazonMusicMobileAPI:
         if not region_to_use:
             region_to_use = self.credentials.account_region
 
-        result_specs = [
-            {
-                "contentRestrictions": {
-                    "allowedParentalControls": {"hasExplicitLanguage": True},
-                    "assetQuality": {"quality": []},
-                    "contentTier": "UNLIMITED" if region_to_use.country != "IN" else "PRIME",
-                    "eligibility": None,
-                },
-                "documentSpecs": [
-                    {
-                        "fields": [
-                            "__default",
-                            "parentalControls.hasExplicitLanguage",
-                            "contentTier",
-                            "artOriginal",
-                            "contentEncoding",
-                        ],
-                        "filters": None,
-                        "type": label_type,
-                    }
-                ],
-                "label": label_type,
-                "maxResults": limit,
-                "pageToken": None,
-                "topHitSpec": None,
-            }
-            for label_type in search_types
-        ]
-
-        data = {
-            "customerIdentity": {
-                "customerId": self.credentials.customer_id,
-                "deviceId": self.credentials.device_info.device_serial_number,
-                "deviceType": AmazonMobileApplication.MUSIC.device_type,
-                "musicRequestIdentityContextToken": None,
-                "sessionId": "123-1234567-5555555",  # this is legit what the app uses :skull:
-            },
-            "explain": None,
-            "features": {
-                "spellCorrection": {
-                    "accepted": None,
-                    "allowCorrection": True,
-                    "rejected": None,
-                },
-                "spiritual": None,  # a boolean, unknown purpose
-                "upsell": {"allowUpsellForCatalogContent": False},
-            },
-            "locale": region_to_use.locale,
-            "musicTerritory": region_to_use.country,
-            "query": query,
-            "queryMetadata": None,
-            "resultSpecs": result_specs,
+        requested_limit = int(limit) if isinstance(limit, int) and limit > 0 else 50
+        page_size = max(1, min(requested_limit, 100))
+        max_pages = 100
+        page_tokens: dict[str, typing.Optional[str]] = {
+            label_type: None for label_type in search_types
         }
+        seen_asins: set[str] = set()
+        collected_docs: list[dict[str, typing.Any]] = []
 
-        response = self.post(url=url, headers=headers, data=data)
-        resp_json = response.json()
+        def _next_token_for_category(category: dict) -> typing.Optional[str]:
+            for token_key in ("nextPageToken", "pageToken", "nextToken"):
+                token = category.get(token_key)
+                if token:
+                    return str(token)
+            # Some responses nest tokens under pagination/meta objects.
+            stack = [category]
+            while stack:
+                cur = stack.pop()
+                if isinstance(cur, dict):
+                    for k, v in cur.items():
+                        lk = str(k).lower()
+                        if "token" in lk and "next" in lk and v:
+                            return str(v)
+                        if isinstance(v, (dict, list, tuple)):
+                            stack.append(v)
+                elif isinstance(cur, (list, tuple)):
+                    for item in cur:
+                        if isinstance(item, (dict, list, tuple)):
+                            stack.append(item)
+            return None
 
-        LOGGER.debug(resp_json)
+        for _ in range(max_pages):
+            result_specs = [
+                {
+                    "contentRestrictions": {
+                        "allowedParentalControls": {"hasExplicitLanguage": True},
+                        "assetQuality": {"quality": []},
+                        "contentTier": "UNLIMITED" if region_to_use.country != "IN" else "PRIME",
+                        "eligibility": None,
+                    },
+                    "documentSpecs": [
+                        {
+                            "fields": [
+                                "__default",
+                                "parentalControls.hasExplicitLanguage",
+                                "contentTier",
+                                "artOriginal",
+                                "contentEncoding",
+                            ],
+                            "filters": None,
+                            "type": label_type,
+                        }
+                    ],
+                    "label": label_type,
+                    "maxResults": page_size,
+                    "pageToken": page_tokens.get(label_type),
+                    "topHitSpec": None,
+                }
+                for label_type in search_types
+            ]
 
-        results = resp_json.get("results", {})
-        if not results:
+            data = {
+                "customerIdentity": {
+                    "customerId": self.credentials.customer_id,
+                    "deviceId": self.credentials.device_info.device_serial_number,
+                    "deviceType": AmazonMobileApplication.MUSIC.device_type,
+                    "musicRequestIdentityContextToken": None,
+                    "sessionId": "123-1234567-5555555",  # this is legit what the app uses :skull:
+                },
+                "explain": None,
+                "features": {
+                    "spellCorrection": {
+                        "accepted": None,
+                        "allowCorrection": True,
+                        "rejected": None,
+                    },
+                    "spiritual": None,  # a boolean, unknown purpose
+                    "upsell": {"allowUpsellForCatalogContent": False},
+                },
+                "locale": region_to_use.locale,
+                "musicTerritory": region_to_use.country,
+                "query": query,
+                "queryMetadata": None,
+                "resultSpecs": result_specs,
+            }
+
+            response = self.post(url=url, headers=headers, data=data)
+            resp_json = response.json()
+            LOGGER.debug(resp_json)
+
+            results = resp_json.get("results", {})
+            if not results:
+                break
+
+            next_page_tokens = {}
+            docs_added_this_page = 0
+            for category in results:
+                if not isinstance(category, dict):
+                    continue
+                label = str(category.get("label") or "")
+                if label:
+                    next_page_tokens[label] = _next_token_for_category(category)
+
+                if int(category.get("totalHitCount", 0)) == 0:
+                    continue
+                for hit in category.get("hits", []):
+                    document = dict(hit.get("document") or {})
+                    if not document:
+                        continue
+                    dedupe_key = str(
+                        document.get("asin")
+                        or document.get("seriesAsin")
+                        or document.get("artistAsin")
+                        or document.get("albumAsin")
+                        or ""
+                    )
+                    if dedupe_key and dedupe_key in seen_asins:
+                        continue
+                    if dedupe_key:
+                        seen_asins.add(dedupe_key)
+                    collected_docs.append(document)
+                    docs_added_this_page += 1
+
+            if asins:
+                for asin in asins:
+                    result = next(
+                        (
+                            doc
+                            for doc in collected_docs
+                            if str(asin)
+                            in {
+                                str(doc.get(item))
+                                for item in ("albumAsin", "artistAsin", "asin", "seriesAsin")
+                                if doc.get(item)
+                            }
+                        ),
+                        None,
+                    )
+                    if result:
+                        return result
+            else:
+                if len(collected_docs) >= requested_limit:
+                    return tuple(collected_docs[:requested_limit])
+
+            page_tokens = {
+                label_type: next_page_tokens.get(label_type)
+                for label_type in search_types
+            }
+            has_more_pages = any(page_tokens.values())
+            if not has_more_pages or docs_added_this_page == 0:
+                break
+
+        if asins:
             return {}
-
-        if not asins:
-            return tuple(self.get_documents_from_search_results(results))
-
-        for asin in asins:
-            if result := self.find_item_by_asin_in_search_results(results, asin):
-                return result
-        else:
-            return {}
+        return tuple(collected_docs[:requested_limit]) if collected_docs else {}
 
     def find_item_by_asin_in_search_results(self, results: dict, asin: str):
         """

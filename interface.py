@@ -854,6 +854,7 @@ class ModuleInterface:
                 release_year=int(release_datetime.strftime("%Y")),
                 explicit=track_data["parentalControls"]["hasExplicitLanguage"],
                 artist_id=track_data.get("artist", {}).get("asin", ""),  # optional
+                id=str(track_id),
                 duration=track_data["duration"],
                 # animated_cover_url="",  # optional
                 # description="",  # optional
@@ -1894,11 +1895,10 @@ class ModuleInterface:
         if not cover_url:
             # Default 600 x 600 cover art
             cover_url = str(album_data.get("image", ""))
-            tracks_cover_art = cover_url
-        else:
-            tracks_cover_art = self.format_cover_url(
-                cover_url, self.options.default_cover_options
-            )
+
+        tracks_cover_art = self.format_cover_url(
+            cover_url, self.options.default_cover_options
+        ) if cover_url else ""
 
         # album_data = self.mobile_session.get_album_info(album_id, use_alternative_naming=True)
         # pprint.pprint(mobile_session.get_page(f"album/{album_id}", region_to_use=media_region))
@@ -1967,7 +1967,7 @@ class ModuleInterface:
             duration=album_data.get("duration"),
             artist_id=album_data.get("artist", {}).get("asin"),  # optional
             # booklet_url="",  # optional
-            cover_url=cover_url,  # optional
+            cover_url=tracks_cover_art or cover_url,  # optional
             cover_type=ImageFileTypeEnum.jpg,  # optional
             all_track_cover_jpg_url=tracks_cover_art,  # technically optional, but HIGHLY recommended
             animated_cover_url="",  # optional
@@ -2089,11 +2089,271 @@ class ModuleInterface:
             for album in mobile_session.search(
                 query=f'"{artist_name}"',
                 search_types=("catalog_album",),
-                limit=100,
+                # Fetch a large pool so artist expand can show the full discography.
+                limit=1000,
                 region_to_use=media_region,
             )
             if artist_name in album.get("artistName", "")
         ]
+
+        # Some regions appear to cap a single textsearch window near 100 albums.
+        # When we detect that plateau, fan out album queries with simple suffixes
+        # and merge newly discovered ASINs.
+        seen_album_asins = {
+            str(a.get("asin"))
+            for a in search_albums
+            if isinstance(a, dict) and a.get("asin")
+        }
+        if 95 <= len(seen_album_asins) <= 130:
+            self.print(
+                f"{module_information.service_name}: Expanding artist albums beyond initial search window..."
+            )
+            suffixes = list("abcdefghijklmnopqrstuvwxyz0123456789")
+            no_new_streak = 0
+            for suffix in suffixes:
+                try:
+                    supplemental = list(
+                        mobile_session.search(
+                            query=f'"{artist_name}" {suffix}',
+                            search_types=("catalog_album",),
+                            limit=1000,
+                            region_to_use=media_region,
+                        )
+                    )
+                except Exception as ex:
+                    LOGGER.debug(
+                        "Artist supplemental album search failed (%s %s): %s",
+                        artist_name,
+                        suffix,
+                        ex,
+                    )
+                    no_new_streak += 1
+                    if no_new_streak >= 8:
+                        break
+                    continue
+
+                added_now = 0
+                for album in supplemental:
+                    if not isinstance(album, dict):
+                        continue
+                    if artist_name not in str(album.get("artistName", "")):
+                        continue
+                    asin = str(album.get("asin") or "")
+                    if not asin or asin in seen_album_asins:
+                        continue
+                    seen_album_asins.add(asin)
+                    search_albums.append(album)
+                    added_now += 1
+
+                if added_now == 0:
+                    no_new_streak += 1
+                else:
+                    no_new_streak = 0
+                if no_new_streak >= 8:
+                    break
+
+        # Textsearch for catalog_album can plateau around 100 in some regions.
+        # Add a secondary source: catalog_track hits -> album ASINs.
+        track_album_hits: list[dict] = []
+        try:
+            track_hits = list(
+                mobile_session.search(
+                    query=f'"{artist_name}"',
+                    search_types=("catalog_track",),
+                    limit=1000,
+                    region_to_use=media_region,
+                )
+            )
+            for hit in track_hits:
+                if not isinstance(hit, dict):
+                    continue
+                hit_artist = str(hit.get("artistName") or "")
+                if artist_name not in hit_artist:
+                    continue
+                meta = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
+                album_asin = (
+                    hit.get("albumAsin")
+                    or meta.get("albumAsin")
+                    or meta.get("albumGlobalAsin")
+                )
+                if not album_asin:
+                    continue
+                track_album_hits.append(
+                    {
+                        "asin": str(album_asin),
+                        "artistName": hit_artist or artist_name,
+                        "title": str(meta.get("albumTitle") or ""),
+                        "artOriginal": (
+                            {"artUrl": str((meta.get("albumArt") or {}).get("url") or "")}
+                            if isinstance(meta.get("albumArt"), dict)
+                            else {}
+                        ),
+                        "metadata": meta,
+                    }
+                )
+        except Exception as ex:
+            LOGGER.debug("Artist track-album harvest failed (%s): %s", artist_id, ex)
+
+        # Some territories/accounts return only ~20 albums from textsearch.
+        # Use artist muse pages as an additional source and merge both sets.
+        def _extract_album_docs(obj):
+            docs = []
+            seen_doc_asins: set[str] = set()
+            stack = [obj]
+
+            def _maybe_add_doc(candidate: dict, asin_value: str):
+                asin_norm = str(asin_value or "").strip().upper()
+                if not re.fullmatch(r"[A-Z0-9]{10}", asin_norm):
+                    return
+                if asin_norm in seen_doc_asins:
+                    return
+                seen_doc_asins.add(asin_norm)
+                materialized = dict(candidate)
+                materialized["asin"] = asin_norm
+                docs.append(materialized)
+
+            def _extract_asin_from_string(text: str) -> typing.Optional[str]:
+                s = str(text or "")
+                patterns = (
+                    r"(?:/albums?/|album/|asin=)([A-Z0-9]{10})",
+                    r"\b([A-Z0-9]{10})\b",
+                )
+                for pat in patterns:
+                    m = re.search(pat, s, re.IGNORECASE)
+                    if m:
+                        return str(m.group(1)).upper()
+                return None
+
+            while stack:
+                current = stack.pop()
+                if isinstance(current, dict):
+                    direct_asins = []
+                    for key, value in current.items():
+                        lk = str(key).lower()
+                        if "asin" in lk:
+                            if isinstance(value, str):
+                                direct_asins.append(value)
+                            elif isinstance(value, (list, tuple)):
+                                for item in value:
+                                    if isinstance(item, str):
+                                        direct_asins.append(item)
+                    for asin_value in direct_asins:
+                        _maybe_add_doc(current, str(asin_value))
+
+                    # Artist pages frequently store album IDs in links/URIs/actions.
+                    for value in current.values():
+                        if isinstance(value, str):
+                            asin_from_link = _extract_asin_from_string(value)
+                            if asin_from_link:
+                                _maybe_add_doc(current, asin_from_link)
+                        elif isinstance(value, (dict, list, tuple)):
+                            stack.append(value)
+
+                elif isinstance(current, (list, tuple)):
+                    for item in current:
+                        if isinstance(item, (dict, list, tuple)):
+                            stack.append(item)
+                        elif isinstance(item, str):
+                            asin_from_link = _extract_asin_from_string(item)
+                            if asin_from_link:
+                                docs.append({"asin": asin_from_link})
+
+            # Deduplicate fallback dict-only rows generated from string-only matches.
+            deduped = {}
+            for d in docs:
+                asin = str(d.get("asin") or "").upper()
+                if asin and asin not in deduped:
+                    deduped[asin] = d
+            return list(deduped.values())
+
+        page_albums = []
+        seen_page_asins: set[str] = set()
+        def _extract_next_token(obj):
+            if not isinstance(obj, (dict, list, tuple)):
+                return None
+            stack = [obj]
+            while stack:
+                cur = stack.pop()
+                if isinstance(cur, dict):
+                    for key, value in cur.items():
+                        lk = str(key).lower()
+                        if "token" in lk and "next" in lk and value:
+                            return str(value)
+                        if isinstance(value, (dict, list, tuple)):
+                            stack.append(value)
+                elif isinstance(cur, (list, tuple)):
+                    for item in cur:
+                        if isinstance(item, (dict, list, tuple)):
+                            stack.append(item)
+            return None
+
+        next_token = None
+        page_count = 200
+        offset = 0
+        for _ in range(40):  # hard stop guard
+            try:
+                artist_page = mobile_session.get_page(
+                    f"artist/{artist_id}",
+                    count=page_count,
+                    next_token=next_token,
+                    offset=offset if not next_token else None,
+                    region_to_use=media_region,
+                )
+            except Exception as ex:
+                LOGGER.debug("Artist page fetch failed (%s): %s", artist_id, ex)
+                break
+
+            docs = _extract_album_docs(artist_page)
+            added = 0
+            for doc in docs:
+                asin = str(doc.get("asin") or "")
+                if not asin or asin in seen_page_asins:
+                    continue
+                seen_page_asins.add(asin)
+                page_albums.append(doc)
+                added += 1
+
+            if getattr(self.options, "debug_mode", False):
+                self.print(
+                    f"{module_information.service_name}: artist page debug -> "
+                    f"added_per_page={added}, offset={offset}, next_token={'yes' if next_token else 'no'}"
+                )
+
+            extracted_token = _extract_next_token(artist_page)
+            if extracted_token:
+                next_token = extracted_token
+                continue
+
+            # Fallback for regions where artist pages paginate by offset without exposing next tokens.
+            next_token = None
+            if added == 0:
+                break
+            offset += page_count
+
+        if page_albums:
+            seen_search_asins = {str(a.get("asin")) for a in search_albums if isinstance(a, dict) and a.get("asin")}
+            for album in page_albums:
+                asin = str(album.get("asin") or "")
+                if asin and asin not in seen_search_asins:
+                    search_albums.append(album)
+                    seen_search_asins.add(asin)
+
+        if track_album_hits:
+            seen_search_asins = {str(a.get("asin")) for a in search_albums if isinstance(a, dict) and a.get("asin")}
+            for album in track_album_hits:
+                asin = str(album.get("asin") or "")
+                if asin and asin not in seen_search_asins:
+                    search_albums.append(album)
+                    seen_search_asins.add(asin)
+
+        if getattr(self.options, "debug_mode", False):
+            self.print(
+                f"{module_information.service_name}: artist merge debug -> "
+                f"search_albums={len(search_by_asin) if 'search_by_asin' in locals() else len(search_albums)}, "
+                f"page_albums={len(page_albums)}, "
+                f"track_album_hits={len(track_album_hits)}, merged_candidates={len(search_albums)}"
+            )
+
         # Map requested ASIN -> search hit so we can pair batched metadata back to it.
         search_by_asin: dict[str, dict] = {}
         for album in search_albums:
@@ -2172,6 +2432,16 @@ class ModuleInterface:
                     if album_metadata:
                         fetched_metadata.append(album_metadata)
 
+        def _norm_text(value: typing.Any) -> str:
+            return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+        def _is_various_artists(name: str) -> bool:
+            n = _norm_text(name)
+            return n in {"various artists", "various artist", "various"}
+
+        artist_name_norm = _norm_text(artist_name)
+        artist_id_str = str(artist_id)
+
         added_asins: set[str] = set()
         for album_metadata in fetched_metadata:
             if not album_metadata:
@@ -2182,18 +2452,34 @@ class ModuleInterface:
             album_asin = str(album.get("asin") or "")
             if album_asin in added_asins:
                 continue
-            # Filter out foreign albums with the same artist name (but not ID)
-            if (
-                not album_metadata["artist"]["contributorAsins"]
-                and album_metadata["artist"]["asin"] != artist_id
-            ):
+
+            artist_meta = album_metadata.get("artist") if isinstance(album_metadata.get("artist"), dict) else {}
+            album_artist_name = (
+                album_metadata.get("primaryArtistName")
+                or artist_meta.get("name")
+                or album.get("artistName")
+                or ""
+            )
+            album_artist_norm = _norm_text(album_artist_name)
+            title_norm = _norm_text(album_metadata.get("title") or album.get("title"))
+            primary_artist_match = str(artist_meta.get("asin") or "") == artist_id_str
+            contributor_asins = {
+                str(v)
+                for v in (artist_meta.get("contributorAsins") or [])
+                if v is not None
+            }
+            contributor_match = artist_id_str in contributor_asins
+            exact_artist_name_match = bool(
+                artist_name_norm and album_artist_norm == artist_name_norm
+            )
+
+            # Drop noisy compilation rows unless they are truly primary for this artist.
+            if _is_various_artists(album_artist_name) and not primary_artist_match:
                 continue
 
-            # Assume that if they aren't equal, they are credited albums
-            # artist_id != album.get("artistAsin")
-            if (
-                artist_name != album.get("artistName", "")
-            ) and not get_credited_albums:
+            # Keep only strong ownership links to avoid false positives for name collisions
+            # (e.g. "The Blessed Madonna", "Luigi Madonna").
+            if not primary_artist_match and not contributor_match and not exact_artist_name_match:
                 continue
 
             added_asins.add(album_asin)
@@ -2290,15 +2576,48 @@ class ModuleInterface:
 
         embedded_lyrics = ""
         synced_lyrics = ""
-        if int(track_lyrics_resp.get("lyricsResponseCode", 0)) == 1002:
-            for line in track_lyrics_resp.get("lyrics", {}).get("lines", {}):
-                text = line["text"]
+        lyrics_payload = track_lyrics_resp.get("lyrics", {}) if isinstance(track_lyrics_resp, dict) else {}
+        lines = lyrics_payload.get("lines", [])
 
-                start_time = int(line["startTime"])
+        if isinstance(lines, dict):
+            lines = list(lines.values())
+
+        parsed_lines = []
+        for line in lines if isinstance(lines, list) else []:
+            if not isinstance(line, dict):
+                continue
+            text = str(line.get("text") or "").strip()
+            if not text:
+                continue
+            start_time_raw = line.get("startTime")
+            if start_time_raw is None:
+                parsed_lines.append((None, text))
+                continue
+            try:
+                start_time = int(start_time_raw)
+            except (TypeError, ValueError):
+                parsed_lines.append((None, text))
+                continue
+            parsed_lines.append((start_time, text))
+
+        if parsed_lines:
+            for start_time, text in parsed_lines:
+                if start_time is None:
+                    embedded_lyrics += f"{text}\n"
+                    continue
                 start_time_str = self.milliseconds_to_lrc_time(start_time)
-
                 embedded_lyrics += f"[{start_time_str}] {text}\n"
                 synced_lyrics += f"[{start_time_str}]{text}\n"
+        else:
+            # Some regions/tracks can return unsynced-only payloads without `lines`.
+            plain_text = (
+                lyrics_payload.get("text")
+                or lyrics_payload.get("plainText")
+                or lyrics_payload.get("displayText")
+                or track_lyrics_resp.get("lyricsText")
+            ) if isinstance(track_lyrics_resp, dict) else None
+            if plain_text:
+                embedded_lyrics = str(plain_text).strip()
 
         return LyricsInfo(
             embedded=embedded_lyrics, synced=synced_lyrics
@@ -3196,6 +3515,14 @@ class ModuleInterface:
                     f"fallback:{max_track_quality_to_use}",
                     f"{module_information.service_name}: {max_track_quality_to_use} is not on every "
                     "track; using the highest available quality where needed.",
+                )
+            # If user explicitly chose UHD/HD, prefer a lossless fallback before dropping to lossy.
+            if not track_to_use and max_track_quality_to_use in ("UHD", "HD"):
+                track_to_use = self._select_audio_track_for_tier(
+                    mapped_audio_tracks,
+                    QualityEnum.LOSSLESS,
+                    codec_options,
+                    to_print=False,
                 )
 
         if not track_to_use:
