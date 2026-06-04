@@ -1784,6 +1784,24 @@ class ModuleInterface:
                 return label
         return None
 
+    def _album_quality_from_catalog(
+        self,
+        album_catalog: dict,
+        search_hit: typing.Optional[dict] = None,
+    ) -> str:
+        """Album-level quality from catalog flags (matches search/discography Additional column)."""
+        if not isinstance(album_catalog, dict):
+            return ""
+        catalog_tags = self._catalog_quality_tags_from_entity_and_tracks(album_catalog)
+        if isinstance(search_hit, dict):
+            for tag in self._catalog_quality_tags_from_entity_and_tracks(search_hit):
+                if tag not in catalog_tags:
+                    catalog_tags.append(tag)
+        if not catalog_tags:
+            return ""
+        labels = self._amazon_catalog_quality_display_labels(catalog_tags)
+        return " / ".join(labels) if labels else ""
+
     def _amazon_search_track_quality_labels(
         self,
         mobile_session: AmazonMusicMobileAPI,
@@ -1929,7 +1947,9 @@ class ModuleInterface:
             self._quality_label_from_mapped(mapped_audio_tracks)
             for mapped_audio_tracks in mapped_tracks.values()
         }
-        album_quality_summary = self._best_quality_display(track_quality_labels)
+        search_hit = data.get(f"{album_id}_search") if data else None
+        catalog_quality = self._album_quality_from_catalog(album_data, search_hit)
+        album_quality_summary = catalog_quality or self._best_quality_display(track_quality_labels)
         track_extra_kwargs = (
             {track["asin"]: track for track in album_data.get("tracks", [])}
             | {album_id: album_data}
